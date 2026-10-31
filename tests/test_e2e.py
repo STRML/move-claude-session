@@ -165,6 +165,19 @@ class E2E(unittest.TestCase):
         rows = {line.split()[0]: line for line in self.run_cli("--list").stdout.splitlines()}
         self.assertTrue(rows[S[2]].endswith("Renamed by Claude"))
 
+    def test_label_cache_keeps_other_folders_and_drops_moved_transcripts(self):
+        cache = os.path.join(self.home, ".cache", "move-claude-session", "labels.json")
+        self.env["CMUX_SURFACE_ID"] = "none"
+        self.run_cli("--list")
+        with open(cache) as fh:
+            before = set(json.load(fh))
+        self.run_cli(S[4], "work")   # moves S4's transcript away
+        self.run_cli("--list", cwd=os.path.join(self.home, "code", "dashboard"))
+        with open(cache) as fh:
+            after = set(json.load(fh))
+        self.assertNotIn(self.paths[S[4]], after)
+        self.assertEqual(before - {self.paths[S[4]]}, after - {self.transcript(".claude-work", S[4])})
+
     # ------------------------------------------------------------ picker
 
     def test_enter_enter_moves_this_panes_session_and_resumes_it(self):

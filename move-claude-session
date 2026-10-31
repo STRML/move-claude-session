@@ -385,8 +385,12 @@ def cached_labels(paths):
             label, dirty = read_label(path), True
         out[path] = label
         fresh[path] = key + list(label)
-    if dirty or len(fresh) != len(cache):
-        save_cache(fresh)
+    # Keep other folders' entries too, so changing directory doesn't evict them.
+    # Entries leave the cache when their transcript is gone (moved or deleted).
+    gone = [p for p in cache if p not in fresh and not os.path.exists(p)]
+    if dirty or gone:
+        kept = {p: v for p, v in cache.items() if p not in fresh and p not in gone}
+        save_cache({**kept, **fresh})
     return out
 
 
