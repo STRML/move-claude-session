@@ -116,6 +116,8 @@ projects/<project>/cship/<session-id>-*   cship caches
 
 The session keeps its project folder name in the new account, so `claude --resume` finds it from the same working directory. Every old path inside the moved transcripts is rewritten to its new location, so saved tool output still resolves.
 
+The move copies everything first, rewrites the copies, and deletes the originals only after that succeeds. If a copy fails, the copies are removed and the session is left untouched where it was.
+
 </details>
 
 <details>

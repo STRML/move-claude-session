@@ -282,6 +282,33 @@ class E2E(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIsNotNone(self.transcript(".claude", S[3]))
 
+    def test_failed_copy_leaves_the_source_whole_and_no_partial_copy(self):
+        src = os.path.join(self.home, ".claude", "file-history", S[1])
+        os.makedirs(src, exist_ok=True)
+        blocked = os.path.join(src, "unreadable")
+        with open(blocked, "w") as fh:
+            fh.write("x")
+        os.chmod(blocked, 0)
+        try:
+            r = self.run_cli(S[1], "work")
+        finally:
+            os.chmod(blocked, 0o600)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("nothing changed", r.stderr)
+        self.assertEqual(self.transcript(".claude", S[1]), self.paths[S[1]])
+        with open(self.paths[S[1]]) as fh:   # paths inside were not rewritten
+            self.assertNotIn(".claude-work", fh.read())
+        self.assertIsNone(self.transcript(".claude-work", S[1]))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".claude-work", "file-history", S[1])))
+
+    def test_destination_collision_stops_before_copying_anything(self):
+        clash = os.path.join(self.home, ".claude-work", "file-history", S[1])
+        os.makedirs(clash)
+        r = self.run_cli(S[1], "work")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("already exists", r.stderr)
+        self.assertIsNone(self.transcript(".claude-work", S[1]))
+
     def test_cli_rejects_unknown_account(self):
         r = self.run_cli(S[1], "nope")
         self.assertEqual(r.returncode, 1)
