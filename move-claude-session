@@ -233,13 +233,53 @@ def transcripts_under(path: str):
             for f in files if f.endswith(".jsonl")]
 
 
-def transfer(src: str, dst: str, force: bool) -> None:
-    if os.path.lexists(dst):
-        if not force:
-            die(f"destination already exists: {dst} (use --force)")
-        shutil.rmtree(dst) if os.path.isdir(dst) else os.remove(dst)
+def remove(path: str) -> None:
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.remove(path)
+
+
+def copy_item(src: str, dst: str) -> None:
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    shutil.move(src, dst)
+    if os.path.isdir(src) and not os.path.islink(src):
+        shutil.copytree(src, dst, symlinks=True)
+    else:
+        shutil.copy2(src, dst, follow_symlinks=False)
+
+
+def transfer(moves, force: bool) -> None:
+    """Copy every item, rewrite paths in the copies, then delete the sources.
+    A failure before the delete removes the copies and leaves the source whole."""
+    clashes = [dst for _, dst in moves if os.path.lexists(dst)]
+    if clashes and not force:
+        die(f"destination already exists: {clashes[0]} (use --force to overwrite)")
+    copied = []
+    try:
+        for src, dst in moves:
+            remove(dst)
+            copied.append(dst)
+            copy_item(src, dst)
+        for dst in copied:
+            for path in transcripts_under(dst):
+                rewrite_paths(path, moves)
+    except (OSError, shutil.Error) as e:
+        for dst in copied:
+            try:
+                remove(dst)
+            except OSError:
+                pass
+        die(f"move failed, nothing changed: {e}")
+    leftovers = []
+    for src, _ in moves:
+        try:
+            remove(src)
+        except OSError:
+            leftovers.append(src)
+    if leftovers:
+        print("warning: moved, but could not delete these originals. Delete them by hand,\n"
+              "or the session will be found in two accounts:\n  " + "\n  ".join(leftovers),
+              file=sys.stderr)
 
 
 def move_session(session_id: str, target: str, dry: bool, force: bool):
@@ -271,11 +311,7 @@ def move_session(session_id: str, target: str, dry: bool, force: bool):
         return None
 
     title = read_label(src_jsonl)[1] or session_id
-    for src, dst in moves:
-        transfer(src, dst, force)
-    for _, dst in moves:
-        for path in transcripts_under(dst):
-            rewrite_paths(path, moves)
+    transfer(moves, force)
     save_last_target(target)
     print(f"moved {title}: {source} → {target} ({len(moves)} items)")
     return resume_dir(moves[0][1], proj)
