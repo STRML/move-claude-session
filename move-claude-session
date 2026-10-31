@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""move-claude-session — move a Claude Code session to another account.
+
+Each account keeps its sessions under its own config dir, found by looking for a
+`projects/` folder:
+
+    default   ~/.claude           (CLAUDE_CONFIG_DIR unset)
+    <name>    ~/.claude-<name>    (CLAUDE_CONFIG_DIR=~/.claude-<name>)
+
+This tool finds a session in whichever account holds it and moves it to the target
+account, under the same project folder, so `claude --resume <id>` with that account's
+CLAUDE_CONFIG_DIR finds it.
+
+Usage:
+    move-claude-session                     pick a session, pick an account, move, resume
+    move-claude-session <session_id> <account>
+
+With no arguments it opens a picker. The session that last ran in this terminal pane
+(from cmux's hook log) is listed first, then other sessions from this cmux workspace,
+then the most recent sessions in every account. Type to filter, arrows to move, Enter
+to pick, Esc to cancel. After the move it runs `claude --resume <id>` under the new
+account, from the session's project directory.
+
+Options:
+    -n, --dry-run   Show what would happen; change nothing.
+    --copy          Keep the source files (default is to move).
+    --force         Overwrite existing files at the destination, and move a session
+                    that is still running.
+    --list          Print the picker's candidates in rank order and exit.
+    -h, --help      This help.
+
+A session counts as running while a live process has registered it in
+<account>/sessions/<pid>.json. Claude Code deletes that file on exit.
+
+What it moves (paths relative to the account's config dir):
+    projects/<proj>/<session_id>.jsonl    transcript
+    projects/<proj>/<session_id>/         subagents, tool-results
+    projects/<proj>/cship/<session_id>-*  cship caches
+    <dir>/*<session_id>*                  per-session entries in every other top-level
+                                          dir (file-history, tasks, session-env, ...)
+
+The transcript and subagent transcripts have each moved path rewritten to its new
+location, so persisted tool output still resolves. Nothing else is rewritten.
+"""
+
+import functools
+import json
+import mmap
+import os
+import re
+import shlex
+import shutil
+import sys
+import time
+
+DEFAULT_ACCOUNT = "default"
+CMUX_HOOK_SESSIONS = "~/.cmuxterm/claude-hook-sessions.json"
+RECENT_LIMIT = 40          # most recent transcripts offered beyond the cmux matches
+PROMPT_SCAN_BYTES = 256 * 1024   # where to look for the first prompt
+
+
+def die(msg: str) -> "NoReturn":
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+@functools.lru_cache(maxsize=None)
+def accounts():
+    """{name: config dir} for every Claude Code config dir that holds projects."""
+    home = os.path.expanduser("~")
+    found = {}
+    if os.path.isdir(os.path.join(home, ".claude", "projects")):
+        found[DEFAULT_ACCOUNT] = os.path.join(home, ".claude")
+    for entry in sorted(os.listdir(home)):
+        path = os.path.join(home, entry)
+        if entry.startswith(".claude-") and os.path.isdir(os.path.join(path, "projects")):
+            found[entry[len(".claude-"):]] = path
+    return found
+
+
+def account_root(name: str) -> str:
+    return accounts()[name]
+
+
+def launch_env(account: str):
+    """The environment that makes plain `claude` use this account."""
+    env = dict(os.environ)
+    env.pop("CLAUDE_CONFIG_DIR", None)   # unset means ~/.claude
+    if account != DEFAULT_ACCOUNT:
+        env["CLAUDE_CONFIG_DIR"] = account_root(account)
+    return env
+
+
+def resume_command(account: str, session_id: str) -> str:
+    prefix = ("" if account == DEFAULT_ACCOUNT
+              else f"CLAUDE_CONFIG_DIR={shlex.quote(account_root(account))} ")
+    return f"{prefix}claude --resume {session_id}"
+
+
+# ---------------------------------------------------------------- session lookup
+
+def find_transcripts(session_id: str):
+    """Every (account, transcript path) holding this session."""
+    hits = []
+    for name in accounts():
+        projects = os.path.join(account_root(name), "projects")
+        if not os.path.isdir(projects):
+            continue
+        for proj in os.listdir(projects):
+            cand = os.path.join(projects, proj, f"{session_id}.jsonl")
+            if os.path.isfile(cand):
+                hits.append((name, cand))
+    return hits
+
+
+def all_transcripts():
+    """(account, session_id, path, mtime) for every top-level transcript."""
+    out = []
+    for name in accounts():
+        projects = os.path.join(account_root(name), "projects")
+        if not os.path.isdir(projects):
+            continue
+        for proj in os.scandir(projects):
+            if not proj.is_dir(follow_symlinks=False):
+                continue
+            try:
+                entries = list(os.scandir(proj.path))
+            except OSError:
+                continue
+            for e in entries:
+                if e.name.endswith(".jsonl") and e.is_file(follow_symlinks=False):
+                    out.append((name, e.name[:-6], e.path, e.stat().st_mtime))
+    return out
+
+
+def pid_alive(pid) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def running_sessions():
+    """{session_id: pid} for sessions a live Claude Code process has registered."""
+    live = {}
+    for name in accounts():
+        d = os.path.join(account_root(name), "sessions")
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            if not f.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    rec = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if isinstance(rec, dict) and pid_alive(rec.get("pid")):
+                live[rec.get("sessionId")] = rec["pid"]
+    return live
+
+
+# ---------------------------------------------------------------- the move itself
+
+def plan_moves(session_id: str, src_root: str, dst_root: str, proj: str):
+    """(src, dst) pairs for every file or dir that belongs to the session."""
+    rel = [os.path.join("projects", proj, f"{session_id}.jsonl")]
+    proj_dir = os.path.join(src_root, "projects", proj)
+    if os.path.isdir(os.path.join(proj_dir, session_id)):
+        rel.append(os.path.join("projects", proj, session_id))
+    cship = os.path.join(proj_dir, "cship")
+    if os.path.isdir(cship):
+        rel += [os.path.join("projects", proj, "cship", f)
+                for f in sorted(os.listdir(cship)) if f.startswith(session_id + "-")]
+    for top in sorted(os.listdir(src_root)):
+        top_dir = os.path.join(src_root, top)
+        if top == "projects" or os.path.islink(top_dir) or not os.path.isdir(top_dir):
+            continue
+        try:
+            names = sorted(os.listdir(top_dir))
+        except PermissionError:
+            print(f"warning: cannot read {top_dir}, skipped", file=sys.stderr)
+            continue
+        rel += [os.path.join(top, f) for f in names if session_id in f]
+    return [(os.path.join(src_root, r), os.path.join(dst_root, r)) for r in rel]
+
+
+def rewrite_paths(path: str, moves) -> None:
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    for src, dst in moves:
+        text = text.replace(src, dst)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def resume_dir(jsonl_path: str, proj: str) -> str:
+    """The cwd that names the project folder, which is where --resume looks.
+
+    A session that entered a worktree records later cwds that no longer match it,
+    so fall back to the last cwd only when none does.
+    """
+    last = "."
+    with open(jsonl_path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                cwd = json.loads(line).get("cwd")
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if not cwd:
+                continue
+            if re.sub(r"[^A-Za-z0-9]", "-", cwd) == proj:
+                return cwd
+            last = cwd
+    return last
+
+
+def transcripts_under(path: str):
+    if os.path.isfile(path):
+        return [path] if path.endswith(".jsonl") else []
+    return [os.path.join(d, f) for d, _, files in os.walk(path)
+            for f in files if f.endswith(".jsonl")]
+
+
+def transfer(src: str, dst: str, copy: bool, force: bool) -> None:
+    if os.path.lexists(dst):
+        if not force:
+            die(f"destination already exists: {dst} (use --force)")
+        shutil.rmtree(dst) if os.path.isdir(dst) else os.remove(dst)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if not copy:
+        shutil.move(src, dst)
+    elif os.path.isdir(src):
+        shutil.copytree(src, dst)
+    else:
+        shutil.copy2(src, dst)
+
+
+def move_session(session_id: str, target: str, dry: bool, copy: bool, force: bool):
+    """Move the session to `target`. Returns the directory to resume from, or None
+    on a dry run."""
+    hits = find_transcripts(session_id)
+    if not hits:
+        die(f"no transcript for session {session_id} in any account")
+    if len(hits) > 1:
+        die("session found in more than one place:\n  "
+            + "\n  ".join(f"{n}: {p}" for n, p in hits))
+    source, src_jsonl = hits[0]
+    if source == target:
+        die(f"session already lives in {target}: {src_jsonl}")
+
+    pid = running_sessions().get(session_id)
+    if pid and not force:
+        die(f"session is still running (pid {pid}). Quit it first, or pass --force.")
+
+    proj = os.path.basename(os.path.dirname(src_jsonl))
+    moves = plan_moves(session_id, account_root(source), account_root(target), proj)
+
+    verb = "copy" if copy else "move"
+    print(f"session : {session_id}")
+    print(f"from    : {source} ({account_root(source)})")
+    print(f"to      : {target} ({account_root(target)})")
+    print(f"project : {proj}")
+    print(f"{verb}    :")
+    for src, _ in moves:
+        print(f"  {os.path.relpath(src, account_root(source))}")
+    if dry:
+        print("\n(dry run, nothing changed)")
+        return None
+
+    for src, dst in moves:
+        transfer(src, dst, copy, force)
+    for _, dst in moves:
+        for path in transcripts_under(dst):
+            rewrite_paths(path, moves)
+    return resume_dir(moves[0][1], proj)
+
+
+# ---------------------------------------------------------------- picker data
+
+def last_record(buf, rtype: str):
+    """The last JSON line of type `rtype` in the transcript buffer, or None."""
+    at = buf.rfind(f'"type":"{rtype}"'.encode())
+    if at < 0:
+        return None
+    start = buf.rfind(b"\n", 0, at) + 1
+    end = buf.find(b"\n", at)
+    try:
+        rec = json.loads(buf[start:end if end >= 0 else len(buf)])
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def first_prompt(buf):
+    """(cwd, first thing typed) from the head of the transcript."""
+    cwd = prompt = ""
+    for raw in buf[:PROMPT_SCAN_BYTES].splitlines():
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        cwd = cwd or rec.get("cwd") or ""
+        if rec.get("type") == "user" and not rec.get("isMeta"):
+            text = prompt_text((rec.get("message") or {}).get("content"))
+            if text and text not in UNINFORMATIVE_PROMPTS:
+                return cwd, text
+    return cwd, prompt
+
+
+def read_label(path: str):
+    """(cwd, title) for display. The title is the one Claude Code shows on the tab:
+    a /rename title, else its generated ai-title, else the first typed prompt."""
+    try:
+        with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as buf:
+            custom = last_record(buf, "custom-title") or {}
+            ai = last_record(buf, "ai-title") or {}
+            cwd, prompt = first_prompt(buf)
+    except (OSError, ValueError):   # ValueError: mmap of an empty file
+        return "", ""
+    title = custom.get("customTitle") or ai.get("aiTitle") or prompt
+    return cwd, " ".join(str(title).split())
+
+
+UNINFORMATIVE_PROMPTS = {"/clear", "/compact", "/resume", "/model", "/config",
+                         "/login", "/status", "/cost", "/exit"}
+COMMAND_RE = re.compile(r"<command-name>(.*?)</command-name>", re.S)
+ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+
+
+def prompt_text(content) -> str:
+    """What the user typed: plain text, or `/command args` for a slash command.
+    Tool results and injected <system-reminder> style blocks return ''."""
+    if isinstance(content, list):
+        texts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return next((t for t in map(prompt_text, texts) if t), "")
+    if not isinstance(content, str):
+        return ""
+    cmd = COMMAND_RE.search(content)
+    if cmd:
+        args = ARGS_RE.search(content)
+        return f"{cmd.group(1).strip()} {args.group(1).strip() if args else ''}".strip()
+    return "" if content.lstrip().startswith("<") else content
+
+
+def cache_path() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "move-claude-session", "labels.json")
+
+
+def cached_labels(paths):
+    """{path: (cwd, title)}. Labels are cached per transcript and keyed on its size
+    and mtime, so any write to a transcript (quitting a session included) refreshes
+    its entry. Reading titles from scratch costs about 0.3 s over 400 MB."""
+    try:
+        with open(cache_path(), encoding="utf-8") as fh:
+            cache = json.load(fh)
+        if not isinstance(cache, dict):
+            cache = {}
+    except (OSError, ValueError):
+        cache = {}
+    out, fresh, dirty = {}, {}, False
+    for path in paths:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        key = [st.st_size, st.st_mtime_ns]
+        hit = cache.get(path)
+        if isinstance(hit, list) and len(hit) == 4 and hit[:2] == key:
+            label = (hit[2], hit[3])
+        else:
+            label, dirty = read_label(path), True
+        out[path] = label
+        fresh[path] = key + list(label)
+    if dirty or len(fresh) != len(cache):
+        save_cache(fresh)
+    return out
+
+
+def save_cache(entries) -> None:
+    path = cache_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(entries, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass   # the cache only saves time
+
+
+def cmux_sessions():
+    try:
+        with open(os.path.expanduser(CMUX_HOOK_SESSIONS), encoding="utf-8") as fh:
+            sessions = json.load(fh).get("sessions") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return sessions if isinstance(sessions, dict) else {}
+
+
+def candidates():
+    """Picker rows, best first. Rank 0: last ran in this pane; 1: this workspace;
+    2: everything else recent."""
+    surface = os.environ.get("CMUX_SURFACE_ID")
+    workspace = os.environ.get("CMUX_WORKSPACE_ID")
+    cmux_rank = {}
+    for sid, rec in cmux_sessions().items():
+        if not isinstance(rec, dict):
+            continue
+        if surface and rec.get("surfaceId") == surface:
+            rank = 0
+        elif workspace and rec.get("workspaceId") == workspace:
+            rank = 1
+        else:
+            continue
+        cmux_rank[sid] = (rank, -(rec.get("updatedAt") or 0))
+
+    found = all_transcripts()
+    found.sort(key=lambda t: -t[3])
+    recent = {t[1] for t in found[:RECENT_LIMIT]}
+    live = running_sessions()
+    picked, seen = [], set()
+    for t in found:
+        if t[1] in seen or (t[1] not in recent and t[1] not in cmux_rank):
+            continue
+        seen.add(t[1])
+        picked.append(t)
+    labels = cached_labels([t[2] for t in picked])
+    rows = []
+    for account, sid, path, mtime in picked:
+        cwd, title = labels.get(path, ("", ""))
+        rank, order = cmux_rank.get(sid, (2, -mtime))
+        rows.append({"id": sid, "account": account, "path": path, "mtime": mtime,
+                     "cwd": cwd, "title": title, "rank": rank, "order": order,
+                     "live": live.get(sid)})
+    rows.sort(key=lambda r: (r["rank"], r["order"]))
+    return rows
+
+
+def age(mtime: float) -> str:
+    secs = max(0, time.time() - mtime)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{int(secs // size)}{unit}"
+    return f"{int(secs)}s"
+
+
+def short_path(p: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if p == home or p.startswith(home + "/") else p
+
+
+def row_segments(r):
+    """One picker row as (text, role) pieces; the roles map to colors in pick()."""
+    mark = {0: "» ", 1: "· "}.get(r["rank"], "  ")
+    state = "running" if r["live"] else age(r["mtime"])
+    cwd = short_path(r["cwd"])
+    if len(cwd) > 30:
+        cwd = "…" + cwd[-29:]
+    return [(mark, "mark"),
+            (f"{state:>7}  ", "live" if r["live"] else "age"),
+            (f"{r['account']:<9}", account_role(r["account"])),
+            (f"{cwd:<30}  ", "cwd"),
+            (r["title"] or r["id"], "title" if r["title"] else "dim")]
+
+
+def account_role(name: str) -> str:
+    return f"acct{list(accounts()).index(name) % 4}"
+
+
+def row_text(r) -> str:
+    return "".join(t for t, _ in row_segments(r))
+
+
+# ---------------------------------------------------------------- picker UI
+
+# role: (foreground, bold). -1 is the terminal's default color.
+PALETTE = {
+    "header": (6, True), "prompt": (5, True), "count": (8, False),
+    "mark": (3, True), "age": (2, False), "live": (1, True),
+    "acct0": (4, True), "acct1": (3, True), "acct2": (5, True), "acct3": (2, True),
+    "cwd": (6, False), "title": (-1, False), "dim": (8, False), "hint": (8, False),
+}
+SELECTED_BG = 8   # gray bar behind the highlighted row (needs 16 colors)
+
+
+def pick(header: str, rows, disabled=frozenset()):
+    """Arrow-key list with type-to-filter over rows of (text, role) segments.
+    Returns the chosen index or None."""
+    import curses
+    os.environ.setdefault("ESCDELAY", "25")
+    plain = ["".join(t for t, _ in segs) for segs in rows]
+
+    def init_colors():
+        attrs, sel = {}, {}
+        color = curses.has_colors()
+        if color:
+            curses.start_color()
+            curses.use_default_colors()
+        many = color and curses.COLORS >= 16
+        for n, (role, (fg, bold)) in enumerate(PALETTE.items(), start=1):
+            if fg == 8 and not many:
+                fg = -1
+            base = curses.A_BOLD if bold else 0
+            if color:
+                curses.init_pair(n, fg, -1)
+                attrs[role] = curses.color_pair(n) | base
+            else:
+                attrs[role] = base
+            if not many:
+                sel[role] = curses.A_REVERSE | curses.A_BOLD
+                continue
+            # On the gray bar, default and gray text turn bright white.
+            curses.init_pair(n + 32, 15 if fg in (-1, 8) else fg, SELECTED_BG)
+            sel[role] = curses.color_pair(n + 32) | curses.A_BOLD
+        dim = curses.A_DIM | (attrs["dim"] if color else 0)
+        return attrs, sel, dim
+
+    def draw_row(scr, y, w, segs, attr_map, fill_attr=None):
+        x = 0
+        for text, role in segs:
+            if x >= w - 1:
+                break
+            put(scr, y, x, text, w - 1 - x, attr_map(role))
+            x += len(text)
+        if fill_attr is not None and x < w - 1:
+            put(scr, y, x, " " * (w - 1 - x), w - 1 - x, fill_attr)
+
+    def put(scr, y, x, text, n, attr):
+        try:
+            scr.addnstr(y, x, text, n, attr)
+        except curses.error:   # wide characters can run past the last column
+            pass
+
+    def ui(scr):
+        curses.curs_set(0)
+        attrs, sel, dim = init_colors()
+        query, top = "", 0
+        cur = next((i for i in range(len(rows)) if i not in disabled), 0)
+        while True:
+            words = query.lower().split()
+            shown = [i for i, s in enumerate(plain)
+                     if all(wd in s.lower() for wd in words)]
+            cur = min(cur, max(0, len(shown) - 1))
+            h, w = scr.getmaxyx()
+            body = max(1, h - 4)
+            top = min(max(top, cur - body + 1), cur)
+            scr.erase()
+            put(scr, 0, 0, header, w - 1, attrs["header"])
+            draw_row(scr, 1, w, [("❯ ", "prompt"), (query, "title"),
+                                 (f"  {len(shown)}/{len(rows)}", "count")],
+                     attrs.get)
+            for line, i in enumerate(shown[top:top + body]):
+                y = 3 + line
+                if top + line == cur:
+                    draw_row(scr, y, w, rows[i], sel.get, sel["title"])
+                elif i in disabled:
+                    draw_row(scr, y, w, rows[i], lambda _r: dim)
+                else:
+                    draw_row(scr, y, w, rows[i], attrs.get)
+            hint = "↑↓ move · enter pick · esc cancel · type to filter"
+            if disabled:
+                hint += " · running sessions can't move"
+            put(scr, h - 1, 0, hint, w - 1, attrs["hint"])
+            scr.refresh()
+
+            key = scr.get_wch()
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                if shown and shown[cur] not in disabled:
+                    return shown[cur]
+                curses.beep()
+            elif key in ("\x1b", "\x03"):
+                return None
+            elif key in (curses.KEY_UP, "\x10"):
+                cur = max(0, cur - 1)
+            elif key in (curses.KEY_DOWN, "\x0e"):
+                cur = min(len(shown) - 1, cur + 1)
+            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                query, cur = query[:-1], 0
+            elif isinstance(key, str) and key.isprintable():
+                query, cur = query + key, 0
+
+    try:
+        return curses.wrapper(ui)
+    except KeyboardInterrupt:
+        return None
+
+
+def interactive(dry: bool, copy: bool, force: bool) -> int:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("the picker needs a terminal. Pass <session_id> <account> instead.")
+    rows = candidates()
+    if not rows:
+        die("no sessions found in any account")
+    disabled = frozenset(i for i, r in enumerate(rows) if r["live"] and not force)
+    i = pick("Move which session?  (» last ran in this pane)",
+             [row_segments(r) for r in rows], disabled)
+    if i is None:
+        return 1
+    row = rows[i]
+    targets = [a for a in accounts() if a != row["account"]]
+    if not targets:
+        die("only one Claude Code account found, nowhere to move to")
+    j = pick(f"Move to which account?  (now in {row['account']})",
+             [[(f"{a:<10}", account_role(a)), (short_path(account_root(a)), "cwd")]
+              for a in targets])
+    if j is None:
+        return 1
+    target = targets[j]
+
+    cwd = move_session(row["id"], target, dry, copy, force)
+    if cwd is None:
+        return 0
+    if os.path.isdir(cwd):
+        os.chdir(cwd)
+    else:
+        print(f"warning: {cwd} no longer exists, resuming from {os.getcwd()}",
+              file=sys.stderr)
+        cwd = os.getcwd()
+    print(f"\nresuming as {target} in {short_path(cwd)}\n", flush=True)
+    try:
+        os.execvpe("claude", ["claude", "--resume", row["id"]], launch_env(target))
+    except OSError as e:
+        die(f"moved, but could not launch claude: {e}")
+
+
+def print_list() -> int:
+    for r in candidates():
+        print(f"{r['id']}  {row_text(r)}")
+    return 0
+
+
+def main(argv):
+    args = []
+    dry = copy = force = listing = False
+    for a in argv:
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        elif a in ("-n", "--dry-run"):
+            dry = True
+        elif a == "--copy":
+            copy = True
+        elif a == "--force":
+            force = True
+        elif a == "--list":
+            listing = True
+        elif a.startswith("-"):
+            die(f"unknown option: {a}")
+        else:
+            args.append(a)
+
+    if listing:
+        return print_list()
+    if not args:
+        return interactive(dry, copy, force)
+    if len(args) != 2:
+        die("usage: move-claude-session [<session_id> <account>]. Try --help.")
+    session_id, target = args
+    if target not in accounts():
+        die(f"unknown account: {target} (one of {', '.join(accounts())})")
+
+    cwd = move_session(session_id, target, dry, copy, force)
+    if cwd is not None:
+        print(f"\ndone. resume with:  cd {shlex.quote(cwd)}; {resume_command(target, session_id)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
