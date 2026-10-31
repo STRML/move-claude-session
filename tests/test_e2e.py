@@ -290,6 +290,18 @@ class E2E(unittest.TestCase):
         self.assertIsNone(self.transcript(".claude-work", S[1]))
         self.assertFalse(os.path.exists(os.path.join(self.home, ".claude-work", "file-history", S[1])))
 
+    def test_transcript_with_invalid_utf8_moves_with_bytes_intact(self):
+        with open(self.paths[S[4]], "ab") as fh:
+            fh.write(b'{"type":"user","message":{"content":"bad \xff\xfe byte"}}\n')
+        r = self.run_cli(S[4], "work")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        moved = self.transcript(".claude-work", S[4])
+        with open(moved, "rb") as fh:
+            data = fh.read()
+        self.assertIn(b"bad \xff\xfe byte", data)
+        self.assertIn(os.path.join(self.home, ".claude-work", "projects").encode(), data)
+        self.assertIsNone(self.transcript(".claude", S[4]))
+
     def test_destination_collision_stops_before_copying_anything(self):
         clash = os.path.join(self.home, ".claude-work", "file-history", S[1])
         os.makedirs(clash)

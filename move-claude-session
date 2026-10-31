@@ -200,12 +200,14 @@ def plan_moves(session_id: str, src_root: str, dst_root: str, proj: str):
 
 
 def rewrite_paths(path: str, moves) -> None:
-    with open(path, encoding="utf-8") as fh:
-        text = fh.read()
+    """Point moved paths inside a transcript at their new location. Works on bytes,
+    so a transcript with invalid UTF-8 keeps every byte."""
+    with open(path, "rb") as fh:
+        data = fh.read()
     for src, dst in moves:
-        text = text.replace(src, dst)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
+        data = data.replace(os.fsencode(src), os.fsencode(dst))
+    with open(path, "wb") as fh:
+        fh.write(data)
 
 
 def resume_dir(jsonl_path: str, proj: str) -> str:
@@ -215,7 +217,7 @@ def resume_dir(jsonl_path: str, proj: str) -> str:
     so fall back to the last cwd only when none does.
     """
     last = "."
-    with open(jsonl_path, encoding="utf-8") as fh:
+    with open(jsonl_path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             try:
                 cwd = json.loads(line).get("cwd")
@@ -266,12 +268,14 @@ def transfer(moves, force: bool) -> None:
         for dst in copied:
             for path in transcripts_under(dst):
                 rewrite_paths(path, moves)
-    except (OSError, shutil.Error) as e:
+    except BaseException as e:   # any failure, Ctrl-C included, rolls back the copies
         for dst in copied:
             try:
                 remove(dst)
             except OSError:
                 pass
+        if not isinstance(e, Exception):
+            raise
         die(f"move failed, nothing changed: {e}")
     leftovers = []
     for src, _ in moves:

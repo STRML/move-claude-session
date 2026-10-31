@@ -160,6 +160,13 @@ python3 -m unittest discover tests
 
 The tests build a fake home directory with three accounts and made-up sessions (`tests/fixture.py`), drive the picker through a real pseudo-terminal, and check what moved and how `claude` was launched. The screenshots come from the same fixture: `vhs demo/demo.tape` re-renders them.
 
+The running check depends on `claude agents --json`, which CI can't reach. After a Claude Code update, check it against the real `claude` (it resumes one of your sessions and quits it, without sending a prompt):
+
+```sh
+cd <the session's project directory>
+python3 tools/live-quit-check.py <session-id>
+```
+
 ## License
 
 [MIT](LICENSE)
