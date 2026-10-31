@@ -21,12 +21,14 @@ With no arguments it opens a picker with three sections, newest first in each:
     in this folder     sessions whose project is the current directory
     all sessions       the most recent sessions in every account
 
+The account step preselects the account you moved to last, and is skipped when only
+one other account exists.
+
 Type to filter, arrows to move, Enter to pick, Esc to cancel. After the move it runs
 `claude --resume <id>` under the new account, from the session's project directory.
 
 Options:
     -n, --dry-run   Show what would happen; change nothing.
-    --copy          Keep the source files (default is to move).
     --force         Overwrite existing files at the destination, and move a session
                     that is still running.
     --list          Print the picker's rows, with their section, and exit.
@@ -231,21 +233,16 @@ def transcripts_under(path: str):
             for f in files if f.endswith(".jsonl")]
 
 
-def transfer(src: str, dst: str, copy: bool, force: bool) -> None:
+def transfer(src: str, dst: str, force: bool) -> None:
     if os.path.lexists(dst):
         if not force:
             die(f"destination already exists: {dst} (use --force)")
         shutil.rmtree(dst) if os.path.isdir(dst) else os.remove(dst)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if not copy:
-        shutil.move(src, dst)
-    elif os.path.isdir(src):
-        shutil.copytree(src, dst)
-    else:
-        shutil.copy2(src, dst)
+    shutil.move(src, dst)
 
 
-def move_session(session_id: str, target: str, dry: bool, copy: bool, force: bool):
+def move_session(session_id: str, target: str, dry: bool, force: bool):
     """Move the session to `target`. Returns the directory to resume from, or None
     on a dry run."""
     hits = find_transcripts(session_id)
@@ -265,23 +262,22 @@ def move_session(session_id: str, target: str, dry: bool, copy: bool, force: boo
     proj = os.path.basename(os.path.dirname(src_jsonl))
     moves = plan_moves(session_id, account_root(source), account_root(target), proj)
 
-    verb = "copy" if copy else "move"
-    print(f"session : {session_id}")
-    print(f"from    : {source} ({account_root(source)})")
-    print(f"to      : {target} ({account_root(target)})")
-    print(f"project : {proj}")
-    print(f"{verb}    :")
-    for src, _ in moves:
-        print(f"  {os.path.relpath(src, account_root(source))}")
     if dry:
+        print(f"would move {session_id} from {source} ({account_root(source)})"
+              f" to {target} ({account_root(target)}):")
+        for src, _ in moves:
+            print(f"  {os.path.relpath(src, account_root(source))}")
         print("\n(dry run, nothing changed)")
         return None
 
+    title = read_label(src_jsonl)[1] or session_id
     for src, dst in moves:
-        transfer(src, dst, copy, force)
+        transfer(src, dst, force)
     for _, dst in moves:
         for path in transcripts_under(dst):
             rewrite_paths(path, moves)
+    save_last_target(target)
+    print(f"moved {title}: {source} → {target} ({len(moves)} items)")
     return resume_dir(moves[0][1], proj)
 
 
@@ -392,6 +388,27 @@ def cached_labels(paths):
         kept = {p: v for p, v in cache.items() if p not in fresh and p not in gone}
         save_cache({**kept, **fresh})
     return out
+
+
+def last_target_path() -> str:
+    return os.path.join(os.path.dirname(cache_path()), "last-target")
+
+
+def last_target() -> str:
+    try:
+        with open(last_target_path(), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def save_last_target(account: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(last_target_path()), exist_ok=True)
+        with open(last_target_path(), "w", encoding="utf-8") as fh:
+            fh.write(account + "\n")
+    except OSError:
+        pass   # only a convenience
 
 
 def save_cache(entries) -> None:
@@ -548,9 +565,10 @@ def scroll(top: int, line: int, body: int, lines) -> int:
     return top
 
 
-def pick(header: str, rows, disabled=frozenset(), sections=None):
+def pick(header: str, rows, disabled=frozenset(), sections=None, start=0):
     """Arrow-key list with type-to-filter over rows of (text, role) segments,
-    optionally under section titles. Returns the chosen index or None."""
+    optionally under section titles, starting on row `start`. Returns the chosen
+    index or None."""
     import curses
     os.environ.setdefault("ESCDELAY", "25")
     plain = ["".join(t for t, _ in segs) for segs in rows]
@@ -576,7 +594,7 @@ def pick(header: str, rows, disabled=frozenset(), sections=None):
         attrs = init_colors()
         selected = curses.A_REVERSE | curses.A_BOLD
         query, top = "", 0
-        cur = next((i for i in range(len(rows)) if i not in disabled), 0)
+        cur = next((i for i in [start, *range(len(rows))] if i not in disabled), 0)
         while True:
             words = query.lower().split()
             shown = [i for i, s in enumerate(plain)
@@ -629,7 +647,17 @@ def pick(header: str, rows, disabled=frozenset(), sections=None):
         return None
 
 
-def interactive(dry: bool, copy: bool, force: bool) -> int:
+def pick_account(source: str, targets):
+    """Ask which account to move to, starting on the last one moved to."""
+    last = last_target()
+    j = pick(f"Move to which account?  (now in {source})",
+             [[(f"{a:<10}", account_role(a)), (short_path(account_root(a)), "cwd")]
+              for a in targets],
+             start=targets.index(last) if last in targets else 0)
+    return None if j is None else targets[j]
+
+
+def interactive(dry: bool, force: bool) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         die("the picker needs a terminal. Pass <session_id> <account> instead.")
     rows = candidates()
@@ -646,14 +674,11 @@ def interactive(dry: bool, copy: bool, force: bool) -> int:
     targets = [a for a in accounts() if a != row["account"]]
     if not targets:
         die("only one Claude Code account found, nowhere to move to")
-    j = pick(f"Move to which account?  (now in {row['account']})",
-             [[(f"{a:<10}", account_role(a)), (short_path(account_root(a)), "cwd")]
-              for a in targets])
-    if j is None:
+    target = targets[0] if len(targets) == 1 else pick_account(row["account"], targets)
+    if target is None:
         return 1
-    target = targets[j]
 
-    cwd = move_session(row["id"], target, dry, copy, force)
+    cwd = move_session(row["id"], target, dry, force)
     if cwd is None:
         return 0
     if os.path.isdir(cwd):
@@ -677,15 +702,13 @@ def print_list() -> int:
 
 def main(argv):
     args = []
-    dry = copy = force = listing = False
+    dry = force = listing = False
     for a in argv:
         if a in ("-h", "--help"):
             print(__doc__)
             return 0
         elif a in ("-n", "--dry-run"):
             dry = True
-        elif a == "--copy":
-            copy = True
         elif a == "--force":
             force = True
         elif a == "--list":
@@ -698,14 +721,14 @@ def main(argv):
     if listing:
         return print_list()
     if not args:
-        return interactive(dry, copy, force)
+        return interactive(dry, force)
     if len(args) != 2:
         die("usage: move-claude-session [<session_id> <account>]. Try --help.")
     session_id, target = args
     if target not in accounts():
         die(f"unknown account: {target} (one of {', '.join(accounts())})")
 
-    cwd = move_session(session_id, target, dry, copy, force)
+    cwd = move_session(session_id, target, dry, force)
     if cwd is not None:
         print(f"\ndone. resume with:  cd {shlex.quote(cwd)}; {resume_command(target, session_id)}")
     return 0

@@ -42,7 +42,7 @@ move-claude-session
 ```
 
 1. Pick the session. The one you just quit is on top and already selected.
-2. Pick the account to move it to.
+2. Pick the account to move it to. The one you moved to last time is preselected, and with only one other account this step is skipped.
 
 It moves the session, `cd`s into the session's project directory, and resumes it under the new account.
 
@@ -79,12 +79,11 @@ The title on each row is the one Claude Code puts on the terminal tab: your `/re
 move-claude-session <session-id> <account>
 ```
 
-This moves the session and prints the command to resume it.
+This moves the session and prints the command to resume it. Add `-n` to see every file that would move.
 
 | Option | Effect |
 |---|---|
 | `-n`, `--dry-run` | Show what would move. Change nothing. |
-| `--copy` | Leave the original in place. |
 | `--force` | Overwrite files already at the destination, and move a session that is still running. |
 | `--list` | Print the picker's rows, with session IDs and groups, and exit. |
 
