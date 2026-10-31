@@ -25,7 +25,7 @@ Quit the session, then in the same terminal:
 move-claude-session
 ```
 
-1. Pick the session. The one that last ran in this terminal pane is on top and already selected, so this is usually just Enter.
+1. Pick the session. The one that last ran in this terminal is on top and already selected, so this is usually just Enter.
 2. Pick the account to move it to.
 
 It moves the session, `cd`s to the session's project directory, and resumes it under the new account.
@@ -71,15 +71,15 @@ An account is any config dir in your home directory with a `projects/` folder in
 
 To add one, run `CLAUDE_CONFIG_DIR=~/.claude-work claude` once and log in.
 
-## How the picker orders sessions
+## How the picker groups sessions
 
 ```
-»  last ran in this terminal pane    ┐  from cmux's hook log
-·  ran in this cmux workspace        ┘  (~/.cmuxterm/claude-hook-sessions.json)
-   then the 40 most recently written sessions, across all accounts
+── in this terminal     sessions that ran in this terminal pane (up to 10)
+── in this folder       sessions whose project is the current directory (up to 20)
+── all sessions         the newest sessions in every account (up to 40)
 ```
 
-The pane matching comes from [cmux](https://cmux.dev), which records the pane each Claude Code session runs in. Without cmux the list is ordered by recency, so the session you just quit is still at or near the top.
+Each session appears once, in the first group it fits, and each group is newest first. "In this terminal" comes from [cmux](https://cmux.dev), which records the pane each Claude Code session runs in. Without cmux that group is left out, and the session you just quit is still at the top of "in this folder".
 
 Each row shows the title Claude Code puts on the terminal tab: your `/rename` title if you set one, else the title Claude Code generated, else your first prompt.
 

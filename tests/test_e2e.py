@@ -53,8 +53,8 @@ class E2E(unittest.TestCase):
 
     # ------------------------------------------------------------ helpers
 
-    def run_cli(self, *args):
-        return subprocess.run([sys.executable, SCRIPT, *args], env=self.env,
+    def run_cli(self, *args, cwd=None):
+        return subprocess.run([sys.executable, SCRIPT, *args], env=self.env, cwd=cwd,
                               capture_output=True, text=True, timeout=30)
 
     def run_picker(self, steps, *args):
@@ -109,14 +109,39 @@ class E2E(unittest.TestCase):
 
     # ------------------------------------------------------------ ranking
 
-    def test_list_ranks_this_pane_then_workspace_then_recent(self):
-        r = self.run_cli("--list")
+    def test_list_groups_terminal_then_folder_then_all(self):
+        r = self.run_cli("--list", cwd=os.path.join(self.home, "code", "billing-api"))
         self.assertEqual(r.returncode, 0, r.stderr)
-        ids = [line.split()[0] for line in r.stdout.splitlines()]
-        self.assertEqual(ids, [S[1], S[2], S[3], S[4], S[5], S[6]])
-        self.assertIn("»", r.stdout.splitlines()[0])
-        self.assertIn("running", r.stdout.splitlines()[2])
+        groups = ("in this terminal", "in this folder", "all sessions")
+        rows = [(line[:36], next(g for g in groups if line[38:].startswith(g)))
+                for line in r.stdout.splitlines()]
+        self.assertEqual(rows, [
+            (S[1], "in this terminal"), (S[5], "in this terminal"),   # S5 is a day old
+            (S[6], "in this folder"),
+            (S[2], "all sessions"), (S[3], "all sessions"), (S[4], "all sessions"),
+        ])
+        self.assertIn("running", r.stdout.splitlines()[4])
         self.assertNotIn("system-reminder", r.stdout)
+
+    def test_folder_group_matches_a_session_recorded_under_a_symlink(self):
+        link = os.path.join(self.tmp, "link-to-billing")   # like /tmp -> /private/tmp
+        os.symlink(os.path.join(self.home, "code", "billing-api"), link)
+        sid = "bbbbbbbb-0000-4000-8000-000000000001"
+        folder = os.path.join(self.home, ".claude", "projects", fixture.project_folder(link))
+        os.makedirs(folder)
+        with open(os.path.join(folder, f"{sid}.jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "user", "cwd": link,
+                                 "message": {"content": "hi"}}) + "\n")
+        os.utime(os.path.join(folder, f"{sid}.jsonl"), (1, 1))   # oldest of all
+        self.env["PWD"] = link
+        r = self.run_cli("--list", cwd=link)
+        self.assertIn(f"{sid}  in this folder", r.stdout)
+
+    def test_without_cmux_there_is_no_terminal_group(self):
+        del self.env["CMUX_SURFACE_ID"]
+        r = self.run_cli("--list")
+        self.assertNotIn("in this terminal", r.stdout)
+        self.assertEqual(r.stdout.splitlines()[0].split()[0], S[1])   # newest first
 
     def test_titles_follow_rename_then_ai_title_then_first_prompt(self):
         rows = {line.split()[0]: line for line in self.run_cli("--list").stdout.splitlines()}
@@ -165,14 +190,14 @@ class E2E(unittest.TestCase):
 
     def test_moving_to_default_unsets_config_dir(self):
         self.env["CLAUDE_CONFIG_DIR"] = os.path.join(self.home, ".claude-work")
-        code, out = self.run_picker([("which session", DOWN + ENTER),
+        code, out = self.run_picker([("which session", DOWN + ENTER),   # S5, in client
                                      ("which account", ENTER)])
         self.assertEqual(code, 0, out)
-        self.assertIsNotNone(self.transcript(".claude", S[2]), out)
+        self.assertIsNotNone(self.transcript(".claude", S[5]), out)
         self.assertEqual(self.launched()["config"], "<unset>")
 
     def test_running_session_cannot_be_picked(self):
-        code, out = self.run_picker([("which session", DOWN + DOWN + ENTER),
+        code, out = self.run_picker([("which session", DOWN * 3 + ENTER),   # S3
                                      ("running sessions can't move", ESC)])
         self.assertEqual(code, 1, out)
         self.assertIsNotNone(self.transcript(".claude-work", S[3]))
