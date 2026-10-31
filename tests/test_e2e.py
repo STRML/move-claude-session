@@ -234,6 +234,37 @@ class E2E(unittest.TestCase):
         self.assertIsNotNone(self.transcript(".claude", S[1]))
         self.assertFalse(os.path.exists(os.path.join(self.home, "launched")))
 
+    def test_single_target_skips_the_account_step(self):
+        shutil.rmtree(os.path.join(self.home, ".claude-client"))   # now: default, work
+        code, out = self.run_picker([("which session", ENTER)])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("which account", out)
+        self.assertIsNotNone(self.transcript(".claude-work", S[1]), out)
+
+    def test_account_step_preselects_the_last_target(self):
+        code, out = self.run_picker([("which session", ENTER),               # S1
+                                     ("which account", DOWN + ENTER)])       # work
+        self.assertEqual(code, 0, out)
+        code, out = self.run_picker([("which session", b"monthly"),          # S6, default
+                                     ("1/", ENTER),
+                                     ("which account", ENTER)])
+        self.assertEqual(code, 0, out)
+        self.assertIsNotNone(self.transcript(".claude-work", S[6]), out)
+
+    def test_a_move_prints_one_summary_line_and_dry_run_lists_files(self):
+        r = self.run_cli(S[4], "work")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("moved /review the fish prompt changes: default → work (3 items)", r.stdout)
+        self.assertNotIn("file-history", r.stdout)
+        r = self.run_cli(S[2], "default", "-n")
+        self.assertIn("file-history", r.stdout)
+        self.assertIn("dry run", r.stdout)
+
+    def test_copy_option_is_gone(self):
+        r = self.run_cli(S[4], "work", "--copy")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("unknown option: --copy", r.stderr)
+
     # ------------------------------------------------------------ direct CLI
 
     def test_cli_moves_by_id_and_prints_resume_command(self):
