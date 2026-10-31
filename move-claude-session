@@ -15,18 +15,21 @@ Usage:
     move-claude-session                     pick a session, pick an account, move, resume
     move-claude-session <session_id> <account>
 
-With no arguments it opens a picker. The session that last ran in this terminal pane
-(from cmux's hook log) is listed first, then other sessions from this cmux workspace,
-then the most recent sessions in every account. Type to filter, arrows to move, Enter
-to pick, Esc to cancel. After the move it runs `claude --resume <id>` under the new
-account, from the session's project directory.
+With no arguments it opens a picker with three sections, newest first in each:
+
+    in this terminal   sessions that ran in this terminal pane (from cmux's hook log)
+    in this folder     sessions whose project is the current directory
+    all sessions       the most recent sessions in every account
+
+Type to filter, arrows to move, Enter to pick, Esc to cancel. After the move it runs
+`claude --resume <id>` under the new account, from the session's project directory.
 
 Options:
     -n, --dry-run   Show what would happen; change nothing.
     --copy          Keep the source files (default is to move).
     --force         Overwrite existing files at the destination, and move a session
                     that is still running.
-    --list          Print the picker's candidates in rank order and exit.
+    --list          Print the picker's rows, with their section, and exit.
     -h, --help      This help.
 
 A session counts as running while a live process has registered it in
@@ -55,7 +58,8 @@ import time
 
 DEFAULT_ACCOUNT = "default"
 CMUX_HOOK_SESSIONS = "~/.cmuxterm/claude-hook-sessions.json"
-RECENT_LIMIT = 40          # most recent transcripts offered beyond the cmux matches
+# Picker sections: (title, how many of the newest sessions it shows).
+GROUPS = (("in this terminal", 10), ("in this folder", 20), ("all sessions", 40))
 PROMPT_SCAN_BYTES = 256 * 1024   # where to look for the first prompt
 
 
@@ -407,42 +411,50 @@ def cmux_sessions():
     return sessions if isinstance(sessions, dict) else {}
 
 
-def candidates():
-    """Picker rows, best first. Rank 0: last ran in this pane; 1: this workspace;
-    2: everything else recent."""
-    surface = os.environ.get("CMUX_SURFACE_ID")
-    workspace = os.environ.get("CMUX_WORKSPACE_ID")
-    cmux_rank = {}
-    for sid, rec in cmux_sessions().items():
-        if not isinstance(rec, dict):
-            continue
-        if surface and rec.get("surfaceId") == surface:
-            rank = 0
-        elif workspace and rec.get("workspaceId") == workspace:
-            rank = 1
-        else:
-            continue
-        cmux_rank[sid] = (rank, -(rec.get("updatedAt") or 0))
+def project_folder(cwd: str) -> str:
+    """Claude Code's projects/ folder name for a working directory."""
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
-    found = all_transcripts()
-    found.sort(key=lambda t: -t[3])
-    recent = {t[1] for t in found[:RECENT_LIMIT]}
-    live = running_sessions()
-    picked, seen = [], set()
-    for t in found:
-        if t[1] in seen or (t[1] not in recent and t[1] not in cmux_rank):
+
+def group_of(sid: str, path: str, terminal, here) -> int:
+    if sid in terminal:
+        return 0
+    if os.path.basename(os.path.dirname(path)) in here:
+        return 1
+    return 2
+
+
+def current_dirs():
+    """The current directory as the shell spells it ($PWD, which may run through a
+    symlink), then resolved. $PWD counts only when it still points here."""
+    real = os.getcwd()
+    pwd = os.environ.get("PWD")
+    return [pwd, real] if pwd and pwd != real and os.path.realpath(pwd) == real else [real]
+
+
+def candidates():
+    """Picker rows, grouped and newest first within each group (see GROUPS)."""
+    surface = os.environ.get("CMUX_SURFACE_ID")
+    terminal = {sid for sid, rec in cmux_sessions().items()
+                if surface and isinstance(rec, dict) and rec.get("surfaceId") == surface}
+    here = {project_folder(d) for d in current_dirs()}
+    picked, seen = [[] for _ in GROUPS], set()
+    for t in sorted(all_transcripts(), key=lambda t: -t[3]):
+        account, sid, path, mtime = t
+        if sid in seen:
             continue
-        seen.add(t[1])
-        picked.append(t)
-    labels = cached_labels([t[2] for t in picked])
+        seen.add(sid)
+        group = group_of(sid, path, terminal, here)
+        if len(picked[group]) < GROUPS[group][1]:
+            picked[group].append(t)
+    flat = [(g, t) for g, ts in enumerate(picked) for t in ts]
+    labels = cached_labels([t[2] for _, t in flat])
+    live = running_sessions()
     rows = []
-    for account, sid, path, mtime in picked:
-        cwd, title = labels.get(path, ("", ""))
-        rank, order = cmux_rank.get(sid, (2, -mtime))
+    for group, (account, sid, path, mtime) in flat:
+        cwd_, title = labels.get(path, ("", ""))
         rows.append({"id": sid, "account": account, "path": path, "mtime": mtime,
-                     "cwd": cwd, "title": title, "rank": rank, "order": order,
-                     "live": live.get(sid)})
-    rows.sort(key=lambda r: (r["rank"], r["order"]))
+                     "cwd": cwd_, "title": title, "group": group, "live": live.get(sid)})
     return rows
 
 
@@ -461,13 +473,11 @@ def short_path(p: str) -> str:
 
 def row_segments(r):
     """One picker row as (text, role) pieces; the roles map to colors in pick()."""
-    mark = {0: "» ", 1: "· "}.get(r["rank"], "  ")
     state = "running" if r["live"] else age(r["mtime"])
     cwd = short_path(r["cwd"])
     if len(cwd) > 30:
         cwd = "…" + cwd[-29:]
-    return [(mark, "mark"),
-            (f"{state:>7}  ", "live" if r["live"] else "age"),
+    return [(f"  {state:>7}  ", "live" if r["live"] else "age"),
             (f"{r['account']:<9}", account_role(r["account"])),
             (f"{cwd:<30}  ", "cwd"),
             (r["title"] or r["id"], "title" if r["title"] else "dim")]
@@ -485,55 +495,62 @@ def row_text(r) -> str:
 
 # role: (foreground, bold). -1 is the terminal's default color.
 PALETTE = {
-    "header": (6, True), "prompt": (5, True), "count": (8, False),
-    "mark": (3, True), "age": (2, False), "live": (1, True),
+    "header": (6, True), "prompt": (5, True), "count": (8, False), "section": (5, True),
+    "age": (2, False), "live": (1, True),
     "acct0": (4, True), "acct1": (3, True), "acct2": (5, True), "acct3": (2, True),
     "cwd": (6, False), "title": (-1, False), "dim": (8, False), "hint": (8, False),
 }
-SELECTED_BG = 8   # gray bar behind the highlighted row (needs 16 colors)
 
 
-def pick(header: str, rows, disabled=frozenset()):
-    """Arrow-key list with type-to-filter over rows of (text, role) segments.
-    Returns the chosen index or None."""
+def init_colors():
+    """{role: attr} for normal rows. The selected row is drawn in reverse video
+    instead, which keeps full contrast in any theme."""
+    import curses
+    color = curses.has_colors()
+    if color:
+        curses.start_color()
+        curses.use_default_colors()
+    many = color and curses.COLORS >= 16
+    attrs = {}
+    for n, (role, (fg, bold)) in enumerate(PALETTE.items(), start=1):
+        base = curses.A_BOLD if bold else 0
+        if not color:
+            attrs[role] = base
+            continue
+        curses.init_pair(n, -1 if fg == 8 and not many else fg, -1)
+        attrs[role] = curses.color_pair(n) | base
+    return attrs
+
+
+def layout(shown, sections):
+    """Screen lines for the filtered rows: ("section", title) or ("row", index)."""
+    lines, last = [], None
+    for i in shown:
+        if sections[i] and sections[i] != last:
+            lines.append(("section", sections[i]))
+        last = sections[i]
+        lines.append(("row", i))
+    return lines
+
+
+def scroll(top: int, line: int, body: int, lines) -> int:
+    """New top line that keeps `line` on screen, with its section title when it
+    is the first row of a section."""
+    first = line - 1 if line > 0 and lines[line - 1][0] == "section" else line
+    if first < top:
+        return first
+    if line >= top + body:
+        return line - body + 1
+    return top
+
+
+def pick(header: str, rows, disabled=frozenset(), sections=None):
+    """Arrow-key list with type-to-filter over rows of (text, role) segments,
+    optionally under section titles. Returns the chosen index or None."""
     import curses
     os.environ.setdefault("ESCDELAY", "25")
     plain = ["".join(t for t, _ in segs) for segs in rows]
-
-    def init_colors():
-        attrs, sel = {}, {}
-        color = curses.has_colors()
-        if color:
-            curses.start_color()
-            curses.use_default_colors()
-        many = color and curses.COLORS >= 16
-        for n, (role, (fg, bold)) in enumerate(PALETTE.items(), start=1):
-            if fg == 8 and not many:
-                fg = -1
-            base = curses.A_BOLD if bold else 0
-            if color:
-                curses.init_pair(n, fg, -1)
-                attrs[role] = curses.color_pair(n) | base
-            else:
-                attrs[role] = base
-            if not many:
-                sel[role] = curses.A_REVERSE | curses.A_BOLD
-                continue
-            # On the gray bar, default and gray text turn bright white.
-            curses.init_pair(n + 32, 15 if fg in (-1, 8) else fg, SELECTED_BG)
-            sel[role] = curses.color_pair(n + 32) | curses.A_BOLD
-        dim = curses.A_DIM | (attrs["dim"] if color else 0)
-        return attrs, sel, dim
-
-    def draw_row(scr, y, w, segs, attr_map, fill_attr=None):
-        x = 0
-        for text, role in segs:
-            if x >= w - 1:
-                break
-            put(scr, y, x, text, w - 1 - x, attr_map(role))
-            x += len(text)
-        if fill_attr is not None and x < w - 1:
-            put(scr, y, x, " " * (w - 1 - x), w - 1 - x, fill_attr)
+    sections = sections or [None] * len(rows)
 
     def put(scr, y, x, text, n, attr):
         try:
@@ -541,9 +558,19 @@ def pick(header: str, rows, disabled=frozenset()):
         except curses.error:   # wide characters can run past the last column
             pass
 
+    def draw_row(scr, y, w, segs, attr_of):
+        x = 0
+        for text, role in segs:
+            if x >= w - 1:
+                break
+            put(scr, y, x, text, w - 1 - x, attr_of(role))
+            x += len(text)
+        return x
+
     def ui(scr):
         curses.curs_set(0)
-        attrs, sel, dim = init_colors()
+        attrs = init_colors()
+        selected = curses.A_REVERSE | curses.A_BOLD
         query, top = "", 0
         cur = next((i for i in range(len(rows)) if i not in disabled), 0)
         while True:
@@ -551,22 +578,25 @@ def pick(header: str, rows, disabled=frozenset()):
             shown = [i for i, s in enumerate(plain)
                      if all(wd in s.lower() for wd in words)]
             cur = min(cur, max(0, len(shown) - 1))
+            lines = layout(shown, sections)
             h, w = scr.getmaxyx()
             body = max(1, h - 4)
-            top = min(max(top, cur - body + 1), cur)
+            line = lines.index(("row", shown[cur])) if shown else 0
+            top = scroll(top, line, body, lines) if shown else 0
             scr.erase()
             put(scr, 0, 0, header, w - 1, attrs["header"])
             draw_row(scr, 1, w, [("❯ ", "prompt"), (query, "title"),
-                                 (f"  {len(shown)}/{len(rows)}", "count")],
-                     attrs.get)
-            for line, i in enumerate(shown[top:top + body]):
-                y = 3 + line
-                if top + line == cur:
-                    draw_row(scr, y, w, rows[i], sel.get, sel["title"])
-                elif i in disabled:
-                    draw_row(scr, y, w, rows[i], lambda _r: dim)
+                                 (f"  {len(shown)}/{len(rows)}", "count")], attrs.get)
+            for y, (kind, val) in enumerate(lines[top:top + body], start=3):
+                if kind == "section":
+                    put(scr, y, 0, f"── {val} " + "─" * w, w - 1, attrs["section"])
+                elif shown and val == shown[cur]:
+                    x = draw_row(scr, y, w, rows[val], lambda _r: selected)
+                    put(scr, y, x, " " * w, w - 1 - x, selected)
+                elif val in disabled:
+                    draw_row(scr, y, w, rows[val], lambda _r: attrs["dim"] | curses.A_DIM)
                 else:
-                    draw_row(scr, y, w, rows[i], attrs.get)
+                    draw_row(scr, y, w, rows[val], attrs.get)
             hint = "↑↓ move · enter pick · esc cancel · type to filter"
             if disabled:
                 hint += " · running sessions can't move"
@@ -602,8 +632,10 @@ def interactive(dry: bool, copy: bool, force: bool) -> int:
     if not rows:
         die("no sessions found in any account")
     disabled = frozenset(i for i, r in enumerate(rows) if r["live"] and not force)
-    i = pick("Move which session?  (» last ran in this pane)",
-             [row_segments(r) for r in rows], disabled)
+    here = short_path(current_dirs()[0])
+    titles = [GROUPS[0][0], f"{GROUPS[1][0]} ({here})", GROUPS[2][0]]
+    i = pick("Move which session?", [row_segments(r) for r in rows], disabled,
+             [titles[r["group"]] for r in rows])
     if i is None:
         return 1
     row = rows[i]
@@ -635,7 +667,7 @@ def interactive(dry: bool, copy: bool, force: bool) -> int:
 
 def print_list() -> int:
     for r in candidates():
-        print(f"{r['id']}  {row_text(r)}")
+        print(f"{r['id']}  {GROUPS[r['group']][0]:<16}{row_text(r)}")
     return 0
 
 

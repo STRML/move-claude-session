@@ -14,23 +14,23 @@ import sys
 import time
 
 SURFACE = "11111111-1111-4111-8111-111111111111"     # "this terminal pane"
-WORKSPACE = "22222222-2222-4222-8222-222222222222"   # "this cmux window"
 
-# id, account, project dir under ~/code, tab title, minutes since last write, cmux link.
+# id, account, project dir under ~/code, tab title, minutes since last write,
+# whether cmux saw it run in this terminal pane.
 # The tab title is written as an ai-title record, except where TITLE_SOURCE says.
 SESSIONS = [
     ("aaaaaaaa-0000-4000-8000-000000000001", "default", "billing-api",
-     "Add retry with backoff to the invoice webhook", 2, "surface"),
+     "Add retry with backoff to the invoice webhook", 2, True),
     ("aaaaaaaa-0000-4000-8000-000000000002", "work", "dashboard",
-     "Fix the chart legend overlapping on mobile", 25, "workspace"),
+     "Fix the chart legend overlapping on mobile", 25, False),
     ("aaaaaaaa-0000-4000-8000-000000000003", "work", "infra",
-     "Upgrade the Postgres cluster to 17", 70, None),
+     "Upgrade the Postgres cluster to 17", 70, False),
     ("aaaaaaaa-0000-4000-8000-000000000004", "default", "dotfiles",
-     "/review the fish prompt changes", 180, None),
+     "/review the fish prompt changes", 180, False),
     ("aaaaaaaa-0000-4000-8000-000000000005", "client", "acme-site",
-     "Migrate the contact form to the new CRM", 1500, None),
+     "Migrate the contact form to the new CRM", 1500, True),
     ("aaaaaaaa-0000-4000-8000-000000000006", "default", "billing-api",
-     "Write the monthly usage report query", 4000, None),
+     "Write the monthly usage report query", 4000, False),
 ]
 TITLE_SOURCE = {
     "aaaaaaaa-0000-4000-8000-000000000004": "prompt",   # no ai-title yet
@@ -63,7 +63,7 @@ def build(home: str, live_pid: int = 0) -> dict:
         os.makedirs(os.path.join(home, d, "projects"), exist_ok=True)
     now = time.time()
     paths, cmux = {}, {}
-    for sid, account, proj, title, minutes, link in SESSIONS:
+    for sid, account, proj, title, minutes, in_terminal in SESSIONS:
         cwd = os.path.join(home, "code", proj)
         os.makedirs(cwd, exist_ok=True)
         acct_root = os.path.join(home, ACCOUNT_DIRS[account])
@@ -96,10 +96,8 @@ def build(home: str, live_pid: int = 0) -> dict:
         stamp = now - minutes * 60
         os.utime(path, (stamp, stamp))
         paths[sid] = path
-        if link:
-            cmux[sid] = {"sessionId": sid, "transcriptPath": path, "updatedAt": stamp,
-                         "surfaceId": SURFACE if link == "surface" else "other-pane",
-                         "workspaceId": WORKSPACE}
+        cmux[sid] = {"sessionId": sid, "transcriptPath": path, "updatedAt": stamp,
+                     "surfaceId": SURFACE if in_terminal else "another-pane"}
     os.makedirs(os.path.join(home, ".cmuxterm"), exist_ok=True)
     with open(os.path.join(home, ".cmuxterm", "claude-hook-sessions.json"), "w") as fh:
         json.dump({"sessions": cmux}, fh)
@@ -115,7 +113,7 @@ def env_for(home: str) -> dict:
     """Environment that points the tool at the fake HOME and pane."""
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("CMUX_", "CLAUDE_", "XDG_"))}
-    env.update(HOME=home, CMUX_SURFACE_ID=SURFACE, CMUX_WORKSPACE_ID=WORKSPACE,
+    env.update(HOME=home, CMUX_SURFACE_ID=SURFACE,
                TERM="xterm-256color", LANG="en_US.UTF-8")
     return env
 
