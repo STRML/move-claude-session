@@ -424,14 +424,20 @@ def group_of(sid: str, path: str, terminal, here) -> int:
     return 2
 
 
-def candidates(cwd=None):
+def current_dirs():
+    """The current directory as the shell spells it ($PWD, which may run through a
+    symlink), then resolved. $PWD counts only when it still points here."""
+    real = os.getcwd()
+    pwd = os.environ.get("PWD")
+    return [pwd, real] if pwd and pwd != real and os.path.realpath(pwd) == real else [real]
+
+
+def candidates():
     """Picker rows, grouped and newest first within each group (see GROUPS)."""
     surface = os.environ.get("CMUX_SURFACE_ID")
     terminal = {sid for sid, rec in cmux_sessions().items()
                 if surface and isinstance(rec, dict) and rec.get("surfaceId") == surface}
-    # Both spellings of the current directory: the shell's, which may run through a
-    # symlink, and the resolved one.
-    here = {project_folder(d) for d in (cwd or os.environ.get("PWD"), os.getcwd()) if d}
+    here = {project_folder(d) for d in current_dirs()}
     picked, seen = [[] for _ in GROUPS], set()
     for t in sorted(all_transcripts(), key=lambda t: -t[3]):
         account, sid, path, mtime = t
@@ -626,7 +632,7 @@ def interactive(dry: bool, copy: bool, force: bool) -> int:
     if not rows:
         die("no sessions found in any account")
     disabled = frozenset(i for i, r in enumerate(rows) if r["live"] and not force)
-    here = short_path(os.environ.get("PWD") or os.getcwd())
+    here = short_path(current_dirs()[0])
     titles = [GROUPS[0][0], f"{GROUPS[1][0]} ({here})", GROUPS[2][0]]
     i = pick("Move which session?", [row_segments(r) for r in rows], disabled,
              [titles[r["group"]] for r in rows])

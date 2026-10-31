@@ -136,6 +136,10 @@ class E2E(unittest.TestCase):
         self.env["PWD"] = link
         r = self.run_cli("--list", cwd=link)
         self.assertIn(f"{sid}  in this folder", r.stdout)
+        self.env["PWD"] = os.path.join(self.home, "code", "dashboard")   # stale $PWD
+        r = self.run_cli("--list", cwd=link)
+        self.assertIn(f"{sid}  all sessions", r.stdout)   # stale $PWD is ignored
+        self.assertIn(f"{S[6]}  in this folder", r.stdout)   # real path still matches
 
     def test_without_cmux_there_is_no_terminal_group(self):
         del self.env["CMUX_SURFACE_ID"]
