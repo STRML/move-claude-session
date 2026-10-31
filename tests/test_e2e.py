@@ -26,29 +26,18 @@ S = {i + 1: s[0] for i, s in enumerate(fixture.SESSIONS)}   # S[1] .. S[6]
 
 ENTER, ESC, DOWN = b"\r", b"\x1b", b"\x1bOB"   # keypad mode sends ESC O B
 
-FAKE_CLAUDE = """#!/bin/sh
-{ echo "argv=$*"; echo "cwd=$(pwd)"; echo "config=${CLAUDE_CONFIG_DIR-<unset>}"; } > "$HOME/launched"
-"""
-
-
 class E2E(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.home = os.path.realpath(os.path.join(self.tmp, "home"))
         os.makedirs(self.home)
-        self.live = subprocess.Popen(["sleep", "60"])
-        self.paths = fixture.build(self.home, live_pid=self.live.pid)
+        self.paths = fixture.build(self.home)
         bindir = os.path.join(self.tmp, "bin")
-        os.makedirs(bindir)
-        with open(os.path.join(bindir, "claude"), "w") as fh:
-            fh.write(FAKE_CLAUDE)
-        os.chmod(os.path.join(bindir, "claude"), 0o755)
+        fixture.write_fake_claude(bindir)
         self.env = fixture.env_for(self.home)
         self.env["PATH"] = bindir + os.pathsep + self.env.get("PATH", "/usr/bin:/bin")
 
     def tearDown(self):
-        self.live.kill()
-        self.live.wait()
         shutil.rmtree(self.tmp)
 
     # ------------------------------------------------------------ helpers
@@ -308,6 +297,31 @@ class E2E(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("already exists", r.stderr)
         self.assertIsNone(self.transcript(".claude-work", S[1]))
+
+    def test_unreadable_running_list_blocks_the_move_unless_forced(self):
+        open(os.path.join(self.home, "fake-agents-fail"), "w").close()
+        r = self.run_cli(S[4], "work")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("can't tell which sessions are running", r.stderr)
+        self.assertIn("not logged in", r.stderr)
+        self.assertIsNotNone(self.transcript(".claude", S[4]))
+        r = self.run_cli(S[4], "work", "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_folder_group_matches_a_hashed_long_project_folder(self):
+        deep = os.path.join(self.home, "code", *(["a-rather-long-directory-name"] * 8))
+        os.makedirs(deep)
+        name = fixture.project_folder(deep)
+        self.assertGreater(len(name), 200)
+        folder = os.path.join(self.home, ".claude", "projects", name[:200] + "-1a2b3c")
+        os.makedirs(folder)
+        sid = "cccccccc-0000-4000-8000-000000000001"
+        with open(os.path.join(folder, f"{sid}.jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "user", "cwd": deep, "message": {"content": "deep"}}) + "\n")
+        os.utime(os.path.join(folder, f"{sid}.jsonl"), (1, 1))
+        self.env["PWD"] = deep
+        r = self.run_cli("--list", cwd=deep)
+        self.assertIn(f"{sid}  in this folder", r.stdout)
 
     def test_cli_rejects_unknown_account(self):
         r = self.run_cli(S[1], "nope")

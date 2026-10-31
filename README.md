@@ -125,7 +125,7 @@ The move copies everything first, rewrites the copies, and deletes the originals
 
 <br>
 
-Claude Code registers each live session in `<config dir>/sessions/<pid>.json` and deletes that file on exit. A session counts as running while that file exists and its process is alive. You can move a session the moment you quit it.
+The tool runs `claude agents --json` for every account at once. A session it lists with a live process is running. You can move a session the moment you quit it. If that command fails (say, `claude` isn't on your `PATH`), the tool stops rather than guess. Quit the session and pass `--force` to skip the check.
 
 </details>
 
@@ -137,6 +137,20 @@ Claude Code registers each live session in `<config dir>/sessions/<pid>.json` an
 Titles are cached in `~/.cache/move-claude-session/labels.json` (`$XDG_CACHE_HOME` is respected). Each entry is keyed on its transcript's size and mtime, so a session you just quit always shows its current title. On a machine with about 6,200 transcripts, a run takes about 0.3 s without the cache and under 0.1 s with it.
 
 </details>
+
+## What it relies on
+
+Most of this is documented Claude Code behavior. Titles are the exception: Claude Code calls the transcript format internal and says it changes between versions, so a release can blank the titles. When that happens the tool falls back to your first prompt, and then to the session ID. Moves keep working.
+
+| Need | Source | Documented |
+|---|---|---|
+| Where an account keeps sessions | `CLAUDE_CONFIG_DIR` | ✓ [env vars](https://code.claude.com/docs/en/env-vars) |
+| Where a session's transcript is | `projects/<project>/<session-id>.jsonl`, long names truncated and hashed | ✓ [sessions](https://code.claude.com/docs/en/sessions#where-transcripts-are-stored) |
+| Which sessions are running | `claude agents --json` | ✓ [agent view](https://code.claude.com/docs/en/agent-view) |
+| Resuming | `claude --resume <session-id>` | ✓ [sessions](https://code.claude.com/docs/en/sessions#resume-a-session) |
+| Session titles | `ai-title` and `custom-title` records in the transcript | ✗ internal format |
+| Which terminal a session ran in | cmux's `~/.cmuxterm/claude-hook-sessions.json` | ✗ cmux internal, optional |
+| Files besides the transcript | `file-history/`, `tasks/`, and other per-session entries | ✗ moved as found |
 
 ## Tests
 

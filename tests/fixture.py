@@ -2,7 +2,7 @@
 
 The tests use it, and so do the README screenshots (`demo/demo.tape`):
 
-    python3 tests/fixture.py /tmp/demo-home
+    python3 tests/fixture.py /tmp/demo/home /tmp/demo/bin
 
 Every session, path and prompt here is invented.
 """
@@ -36,7 +36,7 @@ TITLE_SOURCE = {
     "aaaaaaaa-0000-4000-8000-000000000004": "prompt",   # no ai-title yet
     "aaaaaaaa-0000-4000-8000-000000000006": "rename",   # /rename beats ai-title
 }
-RUNNING = "aaaaaaaa-0000-4000-8000-000000000003"   # registered by a live process
+RUNNING = "aaaaaaaa-0000-4000-8000-000000000003"   # listed by `claude agents --json`
 
 ACCOUNT_DIRS = {"default": ".claude", "work": ".claude-work", "client": ".claude-client"}
 
@@ -55,9 +55,30 @@ def user_line(sid, cwd, text):
             "message": {"role": "user", "content": text}}
 
 
-def build(home: str, live_pid: int = 0) -> dict:
-    """Create the fake HOME. `live_pid` registers RUNNING as alive under that pid.
-    Returns {session_id: transcript path}."""
+# Stands in for `claude`. `claude agents --json` prints the account's
+# fake-agents.json (or fails when ~/fake-agents-fail exists); anything else records
+# how it was launched in ~/launched.
+FAKE_CLAUDE = """#!/bin/sh
+if [ "$1" = agents ]; then
+  [ -f "$HOME/fake-agents-fail" ] && { echo "agents: not logged in" >&2; exit 1; }
+  cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/fake-agents.json" 2>/dev/null || echo '[]'
+  exit 0
+fi
+{ echo "argv=$*"; echo "cwd=$(pwd)"; echo "config=${CLAUDE_CONFIG_DIR-<unset>}"; } > "$HOME/launched"
+echo "(claude $* starts here)"
+"""
+
+
+def write_fake_claude(bindir: str) -> None:
+    os.makedirs(bindir, exist_ok=True)
+    path = os.path.join(bindir, "claude")
+    with open(path, "w") as fh:
+        fh.write(FAKE_CLAUDE)
+    os.chmod(path, 0o755)
+
+
+def build(home: str) -> dict:
+    """Create the fake HOME. Returns {session_id: transcript path}."""
     home = os.path.abspath(home)
     for d in ACCOUNT_DIRS.values():
         os.makedirs(os.path.join(home, d, "projects"), exist_ok=True)
@@ -101,11 +122,9 @@ def build(home: str, live_pid: int = 0) -> dict:
     os.makedirs(os.path.join(home, ".cmuxterm"), exist_ok=True)
     with open(os.path.join(home, ".cmuxterm", "claude-hook-sessions.json"), "w") as fh:
         json.dump({"sessions": cmux}, fh)
-    if live_pid:
-        sessions = os.path.join(home, ".claude-work", "sessions")
-        os.makedirs(sessions, exist_ok=True)
-        with open(os.path.join(sessions, f"{live_pid}.json"), "w") as fh:
-            json.dump({"pid": live_pid, "sessionId": RUNNING}, fh)
+    with open(os.path.join(home, ".claude-work", "fake-agents.json"), "w") as fh:
+        json.dump([{"pid": 4242, "sessionId": RUNNING, "cwd": os.path.join(home, "code", "infra"),
+                    "kind": "interactive", "name": "infra-7c", "status": "idle"}], fh)
     return paths
 
 
@@ -119,4 +138,5 @@ def env_for(home: str) -> dict:
 
 
 if __name__ == "__main__":
-    build(sys.argv[1], live_pid=int(sys.argv[2]) if len(sys.argv) > 2 else 0)
+    build(sys.argv[1])
+    write_fake_claude(sys.argv[2])
