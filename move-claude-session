@@ -34,8 +34,8 @@ Options:
     --list          Print the picker's rows, with their section, and exit.
     -h, --help      This help.
 
-A session counts as running while a live process has registered it in
-<account>/sessions/<pid>.json. Claude Code deletes that file on exit.
+A session counts as running while `claude agents --json` lists it for its account.
+Needs `claude` on PATH.
 
 What it moves (paths relative to the account's config dir):
     projects/<proj>/<session_id>.jsonl    transcript
@@ -55,8 +55,10 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 DEFAULT_ACCOUNT = "default"
 CMUX_HOOK_SESSIONS = "~/.cmuxterm/claude-hook-sessions.json"
@@ -139,36 +141,37 @@ def all_transcripts():
     return out
 
 
-def pid_alive(pid) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
-        return False
+def agents_json(account: str):
+    """Live sessions of one account, from `claude agents --json` (documented in the
+    agent view docs). Raises RuntimeError when it can't be read."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        out = subprocess.run(["claude", "agents", "--json"], env=launch_env(account),
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"{account}: {e}") from e
+    if out.returncode != 0:
+        raise RuntimeError(f"{account}: {out.stderr.strip() or f'exit {out.returncode}'}")
+    try:
+        rows = json.loads(out.stdout)
+    except ValueError as e:
+        raise RuntimeError(f"{account}: unreadable output ({e})") from e
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
 
 
-def running_sessions():
-    """{session_id: pid} for sessions a live Claude Code process has registered."""
-    live = {}
-    for name in accounts():
-        d = os.path.join(account_root(name), "sessions")
-        if not os.path.isdir(d):
-            continue
-        for f in os.listdir(d):
-            if not f.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(d, f), encoding="utf-8") as fh:
-                    rec = json.load(fh)
-            except (OSError, ValueError):
-                continue
-            if isinstance(rec, dict) and pid_alive(rec.get("pid")):
-                live[rec.get("sessionId")] = rec["pid"]
-    return live
+def running_sessions(force: bool = False):
+    """{session_id: pid} for every live session in every account, asked of all
+    accounts at once. With force, skip the check."""
+    if force:
+        return {}
+    try:
+        with ThreadPoolExecutor() as pool:
+            found = list(pool.map(agents_json, accounts()))
+    except RuntimeError as e:
+        die(f"can't tell which sessions are running ({e}). "
+            "Quit the session and pass --force to skip this check.")
+    # pid and status are present only while the process is alive.
+    return {r.get("sessionId"): r.get("pid") for rows in found for r in rows
+            if r.get("pid") or r.get("status")}
 
 
 # ---------------------------------------------------------------- the move itself
@@ -220,7 +223,7 @@ def resume_dir(jsonl_path: str, proj: str) -> str:
                 continue
             if not cwd:
                 continue
-            if re.sub(r"[^A-Za-z0-9]", "-", cwd) == proj:
+            if folder_matches(proj, cwd):
                 return cwd
             last = cwd
     return last
@@ -295,8 +298,8 @@ def move_session(session_id: str, target: str, dry: bool, force: bool):
     if source == target:
         die(f"session already lives in {target}: {src_jsonl}")
 
-    pid = running_sessions().get(session_id)
-    if pid and not force:
+    pid = running_sessions(force).get(session_id)
+    if pid:
         die(f"session is still running (pid {pid}). Quit it first, or pass --force.")
 
     proj = os.path.basename(os.path.dirname(src_jsonl))
@@ -469,14 +472,23 @@ def cmux_sessions():
 
 
 def project_folder(cwd: str) -> str:
-    """Claude Code's projects/ folder name for a working directory."""
+    """Claude Code's projects/ folder name for a working directory, before the
+    truncation folder_matches() allows for."""
     return re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def folder_matches(folder: str, cwd: str) -> bool:
+    """Whether a projects/ folder belongs to this working directory. Names over 200
+    characters are cut to 200 and get a hash of the full path appended."""
+    name = project_folder(cwd)
+    return folder == name if len(name) <= 200 else folder.startswith(name[:200])
 
 
 def group_of(sid: str, path: str, terminal, here) -> int:
     if sid in terminal:
         return 0
-    if os.path.basename(os.path.dirname(path)) in here:
+    folder = os.path.basename(os.path.dirname(path))
+    if any(folder_matches(folder, d) for d in here):
         return 1
     return 2
 
@@ -489,12 +501,12 @@ def current_dirs():
     return [pwd, real] if pwd and pwd != real and os.path.realpath(pwd) == real else [real]
 
 
-def candidates():
+def candidates(force: bool = False):
     """Picker rows, grouped and newest first within each group (see GROUPS)."""
     surface = os.environ.get("CMUX_SURFACE_ID")
     terminal = {sid for sid, rec in cmux_sessions().items()
                 if surface and isinstance(rec, dict) and rec.get("surfaceId") == surface}
-    here = {project_folder(d) for d in current_dirs()}
+    here = current_dirs()
     picked, seen = [[] for _ in GROUPS], set()
     for t in sorted(all_transcripts(), key=lambda t: -t[3]):
         account, sid, path, mtime = t
@@ -506,7 +518,7 @@ def candidates():
             picked[group].append(t)
     flat = [(g, t) for g, ts in enumerate(picked) for t in ts]
     labels = cached_labels([t[2] for _, t in flat])
-    live = running_sessions()
+    live = running_sessions(force)
     rows = []
     for group, (account, sid, path, mtime) in flat:
         cwd_, title = labels.get(path, ("", ""))
@@ -696,10 +708,10 @@ def pick_account(source: str, targets):
 def interactive(dry: bool, force: bool) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         die("the picker needs a terminal. Pass <session_id> <account> instead.")
-    rows = candidates()
+    rows = candidates(force)
     if not rows:
         die("no sessions found in any account")
-    disabled = frozenset(i for i, r in enumerate(rows) if r["live"] and not force)
+    disabled = frozenset(i for i, r in enumerate(rows) if r["live"])
     here = short_path(current_dirs()[0])
     titles = [GROUPS[0][0], f"{GROUPS[1][0]} ({here})", GROUPS[2][0]]
     i = pick("Move which session?", [row_segments(r) for r in rows], disabled,
