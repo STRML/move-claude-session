@@ -46,16 +46,11 @@ move-claude-session
 
 It moves the session, `cd`s into the session's project directory, and resumes it under the new account.
 
-<table>
-  <tr>
-    <td width="58%"><img alt="The session picker" src="demo/pick-session.png"></td>
-    <td width="42%"><img alt="The account picker" src="demo/pick-account.png"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub>1 · pick the session</sub></td>
-    <td align="center"><sub>2 · pick the account</sub></td>
-  </tr>
-</table>
+<p align="center"><img alt="The session picker" src="demo/pick-session.png" width="860"><br><sub>1 · pick the session</sub></p>
+
+<p align="center"><img alt="The account picker" src="demo/pick-account.png" width="860"><br><sub>2 · pick the account</sub></p>
+
+<p align="center"><img alt="The move, then the resume" src="demo/done.png" width="860"><br><sub>3 · it moves and resumes</sub></p>
 
 | Key | Action |
 |---|---|
