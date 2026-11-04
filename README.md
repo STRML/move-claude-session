@@ -96,7 +96,69 @@ An account is any config dir in your home directory with a `projects/` folder in
 | `default` | `~/.claude` | `CLAUDE_CONFIG_DIR` unset |
 | `<name>` | `~/.claude-<name>` | `CLAUDE_CONFIG_DIR=~/.claude-<name>` |
 
-To add one, run `CLAUDE_CONFIG_DIR=~/.claude-work claude` once and log in.
+### Add an account
+
+A moved session resumes with the new account's settings, skills, hooks and `CLAUDE.md`. If those differ from the old account's, the conversation continues with different tools and rules than it started with. To avoid that, symlink the shared config from `~/.claude` and keep only the login and the sessions separate:
+
+```
+~/.claude/                 default account, a real directory holding the shared config
+~/.claude-work/
+├── settings.json  ─▶ ~/.claude/settings.json
+├── CLAUDE.md      ─▶ ~/.claude/CLAUDE.md
+├── skills/ agents/ commands/ hooks/ plugins/ rules/  ─▶ ~/.claude/…
+└── credentials, projects/, history                   stay per account
+```
+
+1. Make the config dir: `mkdir ~/.claude-work`.
+2. Link the shared config into it:
+
+   ```sh
+   for f in settings.json CLAUDE.md skills agents commands hooks plugins rules; do
+     [ -e ~/.claude/$f ] && ln -s ~/.claude/$f ~/.claude-work/$f
+   done
+   ```
+
+   If `settings.json` points at a status line script inside `~/.claude`, link that script too.
+3. Add a launcher at `~/.local/bin/claude-work` and make it executable:
+
+   ```sh
+   #!/bin/bash
+   exec env CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude "$@"
+   ```
+
+   Unlike a shell alias, a script runs from any shell, a cron job or a headless `claude-work -p`.
+4. Run `claude-work` and log in with `/login`. Your first session there creates `projects/`, which is how this tool finds the account.
+
+Keep `~/.claude` a real directory. An account switcher that replaces it with a symlink to `~/.claude-<name>` makes this tool list that account twice, once as `default`.
+
+<details>
+<summary><b>Have Claude Code set it up</b></summary>
+
+<br>
+
+Paste this into a Claude Code session:
+
+```text
+Set up a second Claude Code account on this machine that shares my config.
+Ask me for the account name, then use it as NAME below.
+
+1. Leave ~/.claude as it is. It must stay a real directory.
+2. Create ~/.claude-NAME.
+3. In ~/.claude-NAME, symlink each of these from ~/.claude that exists:
+   settings.json, CLAUDE.md, skills, agents, commands, hooks, plugins,
+   rules, and any status line script that settings.json references inside
+   ~/.claude. Do not link credentials, projects/, history or session state.
+4. Write an executable script at ~/.local/bin/claude-NAME:
+       #!/bin/bash
+       exec env CLAUDE_CONFIG_DIR="$HOME/.claude-NAME" claude "$@"
+   Check that ~/.local/bin is on my PATH.
+5. Tell me to run claude-NAME and log in with /login.
+6. After I log in, check that /status in claude-NAME shows the new account,
+   that plain claude still shows the old one, and that a skill in
+   ~/.claude/skills is listed in both.
+```
+
+</details>
 
 ## How it works
 
