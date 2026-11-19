@@ -92,6 +92,7 @@ move-claude-session <session-id> sigint@studio2
 | `-n`, `--dry-run` | Show what would move. Change nothing. |
 | `--force` | Overwrite files already at the destination, and move a session that is still running. On another machine, also stash uncommitted changes in the checkout there instead of refusing. |
 | `--no-code` | On another machine, move the session but not its git checkout. |
+| `--resume` | With `<account>@<host>`, open the moved session on that machine the way the picker does, instead of printing the command. |
 | `--list` | Print the picker's rows, with session IDs and groups, and exit. |
 
 ## Accounts

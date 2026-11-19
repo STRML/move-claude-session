@@ -511,6 +511,38 @@ class Remote(RemoteHarness):
         self.assertFalse(os.path.exists(os.path.join(self.home, "cmux-launched")))
         self.assertFalse(os.path.exists(os.path.join(self.remotes, "studio2.resumed")))
 
+    def test_cli_resume_opens_the_moved_session_in_cmux(self):
+        r = self.run_cli(S[4], "sigint@studio2", "--resume")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.remote_transcript(".claude-sigint", S[4]))
+        launched = self.cmux_launched()
+        self.assertEqual(launched[:2], ["ssh", "studio2"])
+        self.assertEqual(launched[launched.index("--command") + 1],
+                         self.resume_cmd(S[4], ".claude-sigint", "dotfiles"))
+
+    def test_cli_resume_does_not_resume_into_a_missing_project_dir(self):
+        shutil.rmtree(os.path.join(self.home, "code", "dotfiles"))
+        r = self.run_cli(S[4], "sigint@studio2", "--resume")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.remote_transcript(".claude-sigint", S[4]))
+        self.assertIn("does not exist on studio2", r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "cmux-launched")))
+
+    def test_cli_resume_without_cmux_or_a_terminal_is_refused_before_moving(self):
+        del self.env["CMUX_SURFACE_ID"]
+        r = self.run_cli(S[4], "sigint@studio2", "--resume")      # no tty: captured output
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--resume needs a terminal or cmux", r.stderr)
+        self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
+        self.assertEqual(self.transcript(".claude", S[4]), self.paths[S[4]])
+        self.assertFalse(os.path.exists(os.path.join(self.remotes, "studio2.resumed")))
+
+    def test_cli_resume_is_refused_for_a_local_account(self):
+        r = self.run_cli(S[4], "client", "--resume")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--resume needs <account>@<host>", r.stderr)
+        self.assertEqual(self.transcript(".claude", S[4]), self.paths[S[4]])   # nothing moved
+
     def test_cli_moves_to_the_same_account_name_on_the_remote(self):
         r = self.run_cli(S[4], "default@studio2")
         self.assertEqual(r.returncode, 0, r.stderr)
