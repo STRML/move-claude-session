@@ -76,6 +76,10 @@ echo "(claude $* starts here)"
 # connection drops. With `$FAKE_REMOTES/<host>.corrupt`, every uploaded transcript
 # gains a byte. `-t` (the resume) only records the command. Every call prints
 # ssh_config noise on stderr, as a ProxyCommand can on a call that succeeds.
+# `$FAKE_REMOTES/<host>.map` holds "FROM TO": FROM is rewritten to TO in every
+# command, so a path that is the same on both machines can be a different
+# directory here. With `$FAKE_REMOTES/<host>.git-fail` holding a word, git on the
+# host fails whenever that word is one of its arguments.
 FAKE_SSH = """#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_REMOTES/ssh.log"
 echo "Alarm clock: 14  perl -e 'ualarm 300000' nc -z host 22" >&2
@@ -100,6 +104,15 @@ if [ $tty = yes ]; then
   exit 0
 fi
 cd "$home" || exit 255
+if [ -f "$FAKE_REMOTES/$host.map" ]; then
+  read -r from to < "$FAKE_REMOTES/$host.map"
+  set -- "$(printf '%s\\n' "$*" | sed "s|$from|$to|g")"
+fi
+if [ -f "$FAKE_REMOTES/$host.git-fail" ]; then
+  REAL_GIT=$(command -v git) FAKE_GIT_FAIL="$FAKE_REMOTES/$host.git-fail"
+  export REAL_GIT FAKE_GIT_FAIL
+  PATH="$(dirname "$0")/host-git:$PATH"
+fi
 drop=$(cat "$FAKE_REMOTES/$host.drop-on" 2>/dev/null)
 if [ -n "$drop" ] && case "$*" in *"$drop"*) true ;; *) false ;; esac; then
   head -c 512 | HOME="$home" sh -c "$*" >/dev/null 2>&1
@@ -112,6 +125,15 @@ if [ -f "$FAKE_REMOTES/$host.corrupt" ]; then   # flip the upload's transcripts
   find "$home" -path '*.partial/*.jsonl' -exec sh -c 'echo x >> "$1"' sh {} \\;
 fi
 exit $status
+"""
+
+# git on a host with a .git-fail file: fails on that one word, else is git.
+FAKE_HOST_GIT = """#!/bin/sh
+word=$(cat "$FAKE_GIT_FAIL")
+for a; do
+  [ "$a" = "$word" ] && { echo "fatal: injected failure in git $word" >&2; exit 1; }
+done
+exec "$REAL_GIT" "$@"
 """
 
 # Stands in for `cmux`: records how it was called in ~/cmux-launched.
@@ -135,6 +157,7 @@ def write_fake_claude(bindir: str) -> None:
 def write_fake_remote_tools(bindir: str) -> None:
     write_tool(bindir, "ssh", FAKE_SSH)
     write_tool(bindir, "cmux", FAKE_CMUX)
+    write_tool(os.path.join(bindir, "host-git"), "git", FAKE_HOST_GIT)
 
 
 def build_remote(remotes: str, host: str, accounts) -> str:

@@ -90,7 +90,8 @@ move-claude-session <session-id> sigint@studio2
 | Option | Effect |
 |---|---|
 | `-n`, `--dry-run` | Show what would move. Change nothing. |
-| `--force` | Overwrite files already at the destination, and move a session that is still running. |
+| `--force` | Overwrite files already at the destination, and move a session that is still running. On another machine, also stash uncommitted changes in the checkout there instead of refusing. |
+| `--no-code` | On another machine, move the session but not its git checkout. |
 | `--list` | Print the picker's rows, with session IDs and groups, and exit. |
 
 ## Accounts
@@ -203,9 +204,37 @@ The other machine needs:
 
 - an ssh login that works without a prompt (the tool runs ssh with `BatchMode=yes`, so a password or passphrase prompt fails instead of hanging);
 - `sh`, `tar`, and `shasum` or `sha256sum`, which every Mac and most Linux machines have;
-- the session's project at the same absolute path.
+- `git` 2.29 or later, when the session's project is a git checkout (2.31 or later on this machine).
 
-The tool moves the session, not the code. Check the repo out on the other machine first. If the session's directory isn't there, the tool says so and prints the resume command instead of resuming in the wrong place.
+### The code goes too
+
+When the session's project is a git checkout, the checkout moves with it, to the same absolute path on the other machine. No GitHub credentials are needed there, and nothing is committed or pushed here.
+
+| On the other machine | What happens |
+|---|---|
+| No repo at that path | A new repo is made there, with `origin` set to this one's |
+| The repo is there, on an older commit | The branch is fast-forwarded and checked out |
+| The path is a worktree here, and its main repo is there | A worktree is added to that repo |
+| The repo is there with the same commit and changes | Nothing. A rerun after a failed move gets here |
+| The branch has commits this one lacks | Refused. Merge them first |
+| The repo has uncommitted changes | Refused, or stashed with `--force` |
+| The path holds something else, or another repo | Refused |
+
+Then the working tree is laid over the checkout: modified, deleted and untracked files, but not ignored ones. Staged and unstaged changes arrive as plain working-tree changes, with nothing staged. A detached HEAD stays detached. A repo nested inside the working tree (a clone, or a worktree under `.claude/worktrees`) is skipped and named. A repo with submodules or Git LFS files is refused: check those out on the other machine yourself and pass `--no-code`.
+
+`-n` lists the commits and files that would go:
+
+```
+would carry the code in /Users/you/git/api (main at c0eb765). It is checked out there, fast-forwarding main from d0890b0.
+  1 commit to send
+    c0eb765 Retry the invoice webhook with backoff
+  3 changed files
+    M  src/webhook.py
+    D  src/old_retry.py
+    A  tests/test_backoff.py
+```
+
+If the session's directory isn't there after that (a folder that isn't in a repo, or `--no-code`), the tool says so and prints the resume command instead of resuming in the wrong place.
 
 After the move, it resumes the session on the other machine:
 
@@ -216,7 +245,7 @@ After the move, it resumes the session on the other machine:
 
 The command sets `CLAUDE_CONFIG_DIR` to the account's config dir, the same thing the launcher in [Add an account](#add-an-account) does, or clears it for `default`.
 
-`cmux session move` (cmux 0.65 and later) also moves a session to another machine, and carries the git checkout with it. It has no option to pick the account, so it can't move a session from one account to another the way this tool does.
+`cmux session move` (cmux 0.65 and later) also moves a session to another machine, and carries the git checkout the same way. It has no option to pick the account, so it can't move a session from one account to another the way this tool does.
 
 ## How it works
 
@@ -257,6 +286,17 @@ here                                   studio2
 Transcripts are rewritten before they're sent, so paths inside them point at the new account on the other machine. If a step fails, the staging folder is removed and nothing here changes. With `--force`, files it replaces on the other machine are set aside until the rest are in place, and put back if any move fails. Step 4 keeps running if the connection drops, so it either finishes or rolls back, but the tool can't tell which: it deletes nothing here and says so. Run the same move again. If the first one landed, it stops with "destination already exists".
 
 An ssh alias that points back at this machine (`localhost`, say) is refused when the target is the session's own account, since the copy and the original would be the same files.
+
+</details>
+
+<details>
+<summary><b>How the code gets there</b></summary>
+
+<br>
+
+The repo here is only read. Its working tree is saved as a commit, built with a temporary index in a scratch object store that borrows the repo's objects, so nothing is written to the repo, its index or its refs. A `git bundle` of that commit, minus the commits the other machine's refs already hold, goes over ssh with its SHA-256. The other machine checks the hash, fetches the bundle, checks out HEAD, restores the saved working tree over it, and checks the result against the saved commit.
+
+The code goes before the session. If any step after the first change fails, the other machine is put back as it was, including the stash `--force` made, and nothing here changes. If the code lands and the session copy then fails, run the same move again: it finds the code already there and moves only the session.
 
 </details>
 
