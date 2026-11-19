@@ -370,7 +370,8 @@ class Remote(Harness):
     def setUp(self):
         super().setUp()
         self.studio = fixture.build_remote(self.remotes, "studio2", [
-            (".claude", True), (".claude-sigint", True), (".claude-rush", False)])
+            (".claude", "projects"), (".claude-sigint", "projects"), (".claude-rush", "fresh"),
+            (".claude-code-router", "other")])
         self.hosts("studio1", "studio2")
 
     def hosts(self, *names):
@@ -398,8 +399,9 @@ class Remote(Harness):
     def resume_cmd(self, sid, account_dir, proj):
         cwd = os.path.join(self.home, "code", proj)
         root = os.path.join(self.studio, account_dir)
-        return (f"cd {shlex.quote(cwd)} && env CLAUDE_CONFIG_DIR={shlex.quote(root)} "
-                f"claude --resume {sid}")
+        env = ("env -u CLAUDE_CONFIG_DIR" if account_dir == ".claude"
+               else f"env CLAUDE_CONFIG_DIR={shlex.quote(root)}")
+        return f"cd {shlex.quote(cwd)} && {env} claude --resume {sid}"
 
     def assert_untouched_here(self, sid):
         self.assertEqual(self.transcript(".claude", sid), self.paths[sid])
@@ -548,6 +550,8 @@ class Remote(Harness):
         self.assertIn("nothing changed", r.stderr)
         self.assert_untouched_here(S[4])
         self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
+        self.assertEqual([e for e in os.listdir(os.path.join(self.studio, ".claude-sigint"))
+                          if e.startswith(".")], [])
 
     def test_a_host_that_is_this_machine_is_refused_even_with_force(self):
         os.symlink(self.home, os.path.join(self.remotes, "loop"))   # like localhost
@@ -574,6 +578,33 @@ class Remote(Harness):
         self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
         self.assertEqual([e for e in os.listdir(os.path.join(self.studio, ".claude-sigint"))
                           if e.startswith(".")], [])
+
+    def test_a_rollback_that_cannot_undo_keeps_what_it_replaced(self):
+        proj = os.path.basename(os.path.dirname(self.paths[S[4]]))
+        locked = os.path.join(os.path.dirname(self.paths[S[4]]), S[4], "locked")
+        os.makedirs(locked)
+        open(os.path.join(locked, "f"), "w").close()
+        os.chmod(locked, 0o555)   # its remote copy can't be emptied by the rollback
+        sigint = os.path.join(self.studio, ".claude-sigint")
+        older = os.path.join(sigint, "projects", proj, S[4])
+        os.makedirs(older)
+        open(os.path.join(older, "older"), "w").close()
+        hist = os.path.join(sigint, "file-history")
+        os.makedirs(os.path.join(hist, S[4]))
+        os.chmod(hist, 0o555)   # the last item fails, so the move rolls back
+        try:
+            r = self.run_cli(S[4], "sigint@studio2", "--force")
+        finally:
+            for d, _, _ in os.walk(sigint):
+                os.chmod(d, 0o755)
+            os.chmod(locked, 0o755)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("could not undo it all", r.stderr)
+        self.assertNotIn("nothing changed", r.stderr)
+        self.assert_untouched_here(S[4])
+        kept = [os.path.join(d, f) for d, _, fs in os.walk(sigint) for f in fs if f == "older"]
+        self.assertEqual(len(kept), 1, kept)
+        self.assertIn(".partial.old", kept[0])
 
     def test_a_bad_hosts_entry_is_skipped_not_fatal(self):
         self.hosts("studio2 (laptop)")

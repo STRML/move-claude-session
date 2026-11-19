@@ -138,12 +138,16 @@ def write_fake_remote_tools(bindir: str) -> None:
 
 
 def build_remote(remotes: str, host: str, accounts) -> str:
-    """A fake remote host whose home holds these account dirs, each a
-    (dir name, has projects/) pair. Returns the remote home."""
+    """A fake remote host whose home holds these config dirs, each a (dir name,
+    state) pair: "projects" (has sessions), "fresh" (logged in, no projects/ yet,
+    so only .claude.json) or "other" (a dir that isn't a Claude Code account).
+    Returns the remote home."""
     home = os.path.join(remotes, host)
-    for name, has_projects in accounts:
-        os.makedirs(os.path.join(home, name, "projects" if has_projects else ""),
+    for name, state in accounts:
+        os.makedirs(os.path.join(home, name, "projects" if state == "projects" else ""),
                     exist_ok=True)
+        if state == "fresh":
+            open(os.path.join(home, name, ".claude.json"), "w").close()
     return home
 
 

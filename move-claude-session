@@ -367,6 +367,7 @@ DISCOVER = r"""cd || exit 1
 printf 'MCS-HOME %s\n' "$PWD"
 for d in .claude .claude-*; do
   [ -d "$d" ] || continue
+  [ -d "$d/projects" ] || [ -e "$d/.claude.json" ] || [ -e "$d/settings.json" ] || continue
   if [ -d "$d/projects" ]; then p=1; else p=0; fi
   printf 'MCS-ACCOUNT %s %s\n' "$p" "$d"
 done"""
@@ -394,7 +395,9 @@ trap '' HUP PIPE
 old="$stage.old"
 fail() { cd / && rm -rf "$stage" "$old"; printf 'MCS-FAIL %s\n' "$1"; exit 1; }
 cd "$stage" || fail "the uploaded copy is gone"
-if command -v shasum >/dev/null 2>&1; then sum="shasum -a 256"; else sum=sha256sum; fi
+if command -v shasum >/dev/null 2>&1; then sum="shasum -a 256"
+elif command -v sha256sum >/dev/null 2>&1; then sum=sha256sum
+else fail "no shasum or sha256sum to check the copy with"; fi
 n=0
 while read -r want rel; do
   got=$($sum < "$rel" | cut -c1-64) && [ "$got" = "$want" ] || fail "$rel did not arrive intact"
@@ -414,13 +417,19 @@ for rel; do
      { ! there "$root/$rel" || mv "$root/$rel" "$old/$rel"; } &&
      mv "$stage/$rel" "$root/$rel"
   then n=$((n + 1)); continue; fi
-  i=0
+  i=0 stuck=""
   for back; do
     [ "$i" -le "$n" ] || break
-    [ "$i" -lt "$n" ] && rm -rf "$root/$back"
-    there "$old/$back" && mv "$old/$back" "$root/$back"
+    if [ "$i" -lt "$n" ]; then rm -rf "$root/$back" || stuck=1; fi
+    if there "$old/$back"; then
+      if there "$root/$back"; then stuck=1; else mv "$old/$back" "$root/$back" || stuck=1; fi
+    fi
     i=$((i + 1))
   done
+  if [ -n "$stuck" ]; then
+    printf 'MCS-STUCK could not move %s into place, and could not undo it all: what it replaced is kept in %s\n' "$rel" "$old"
+    exit 1
+  fi
   fail "could not move $rel into place"
 done
 cd / && rm -rf "$stage" "$old"
@@ -517,7 +526,7 @@ def remote_accounts(host: str):
             continue
         flag, d = ln[len("MCS-ACCOUNT "):].split(" ", 1)
         name = DEFAULT_ACCOUNT if d == ".claude" else d[len(".claude-"):]
-        if ACCOUNT_RE.match(name):
+        if ACCOUNT_RE.match(name) and name not in found:   # ~/.claude wins "default"
             found[name] = (f"{home}/{d}", flag == "1")
     if not found:
         die(f"no Claude Code config dir on {host} (looked for ~/.claude and ~/.claude-*)")
@@ -533,15 +542,16 @@ def remote_dest(host: str, account: str):
     return host, account, found[account][0]
 
 
-def pack(moves, src_root: str, fh):
+def pack(moves, src_root: str, fh, sums) -> None:
     """Write the session to fh as a tar stream, paths relative to the config dir,
-    transcripts rewritten. Returns a sha256 line for every regular file."""
-    sums = []
+    transcripts rewritten, adding a sha256 line to sums for every regular file."""
     with tarfile.open(fileobj=fh, mode="w|", format=tarfile.PAX_FORMAT) as tar:
         for src, _ in moves:
             for path in [src] + sorted(walk_tree(src)):
                 arc = os.path.relpath(path, src_root)
                 info = tar.gettarinfo(path, arc)
+                if info is None:   # a socket or other special file
+                    continue
                 if not info.isfile():
                     tar.addfile(info)
                     continue
@@ -552,14 +562,16 @@ def pack(moves, src_root: str, fh):
                 info.size = len(data)
                 tar.addfile(info, io.BytesIO(data))
                 sums.append(f"{hashlib.sha256(data).hexdigest()}  {arc}\n")
-    return sums
 
 
 def walk_tree(path: str):
     """Everything under a directory, symlinks included but not followed."""
     if os.path.islink(path) or not os.path.isdir(path):
         return []
-    return [os.path.join(d, n) for d, dirs, files in os.walk(path) for n in dirs + files]
+    def unreadable(e):
+        raise e
+    return [os.path.join(d, n) for d, dirs, files in os.walk(path, onerror=unreadable)
+            for n in dirs + files]
 
 
 def move_remote(session_id, source, src_jsonl, proj, dest, dry, force):
@@ -594,22 +606,28 @@ def move_remote(session_id, source, src_jsonl, proj, dest, dry, force):
     sums = []
     try:
         code, lines, err = ssh_run(host, UPLOAD, [stage], timeout=None,
-                                   feed=lambda fh: sums.extend(pack(moves, src_root, fh)))
-    except OSError as e:   # a local file that can't be read
-        code, lines, err = 1, [], str(e)
+                                   feed=lambda fh: pack(moves, src_root, fh, sums))
+        listing = os.fsencode("".join(sums))
+    except (Exception, KeyboardInterrupt) as e:   # a local file that can't be read, Ctrl-C
+        code, lines, err = 1, [], str(e) or type(e).__name__
     if code != 0 or "MCS-UPLOADED" not in lines:
         if "MCS-CLEAN" in ssh_run(host, CLEANUP, [stage])[1]:
             die(f"copy to {host} failed, nothing changed: {err}")
         die(f"copy to {host} failed: {err}. The session is untouched here. A partial "
             f"copy may be left in {host}:{stage}; the next try replaces it.")
-    listing = "".join(sums).encode()
-    code, lines, err = ssh_run(host, COMMIT, [root, stage, "1" if force else "0", cwd,
-                                              str(len(sums)), *rels],
-                               feed=lambda fh: fh.write(listing), timeout=600)
+    try:
+        code, lines, err = ssh_run(host, COMMIT, [root, stage, "1" if force else "0", cwd,
+                                                  str(len(sums)), *rels],
+                                   feed=lambda fh: fh.write(listing), timeout=600)
+    except KeyboardInterrupt:
+        lines, err = [], "interrupted"
     if "MCS-COMMITTED" not in lines:
         failed = next((ln[len("MCS-FAIL "):] for ln in lines if ln.startswith("MCS-FAIL ")), None)
         if failed:
             die(f"move to {host} failed, nothing changed: {failed}")
+        stuck = next((ln[len("MCS-STUCK "):] for ln in lines if ln.startswith("MCS-STUCK ")), None)
+        if stuck:
+            die(f"move to {host} failed: {stuck}. Nothing was deleted here.")
         die(f"could not confirm the move on {host} ({err}). Nothing was deleted here. "
             f"On {host} the move either finished or rolled itself back: run the same "
             f"move again. If it stops with 'destination already exists', the session "
@@ -644,8 +662,9 @@ def same_inode(path: str, ino: int) -> bool:
 def remote_resume(dest, session_id: str, cwd: str) -> str:
     """The shell command that resumes the session on its host, from its project."""
     _, account, root = dest
-    env = "" if account == DEFAULT_ACCOUNT else f"env CLAUDE_CONFIG_DIR={shlex.quote(root)} "
-    return f"cd {shlex.quote(cwd)} && {env}claude --resume {session_id}"
+    env = ("env -u CLAUDE_CONFIG_DIR " if account == DEFAULT_ACCOUNT
+           else f"env CLAUDE_CONFIG_DIR={shlex.quote(root)} ")
+    return f"cd {shlex.quote(cwd)} && {env}claude --resume {shlex.quote(session_id)}"
 
 
 def login_shell(command: str) -> str:
@@ -1174,7 +1193,7 @@ def main(argv):
         die("usage: move-claude-session [<session_id> <account>[@<host>]]. Try --help.")
     session_id, target = args
     account, _, host = target.partition("@")
-    if host and host != LOCAL:
+    if host and host != LOCAL and target not in accounts():
         return move_to_host(session_id, account, check_host(host), dry, force)
     target = account
     if target not in accounts():

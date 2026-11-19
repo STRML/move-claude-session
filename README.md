@@ -188,7 +188,7 @@ Move to which machine?
   studio2   over ssh
 ```
 
-The account step lists every `~/.claude` and `~/.claude-<name>` on that machine, read over ssh. An account you've logged in to but never run a session in has no `projects/` yet. It's still listed, and picking it creates `projects/`:
+The account step lists the `~/.claude` and `~/.claude-<name>` config dirs on that machine, read over ssh. An account you've logged in to but never run a session in has no `projects/` yet. It's still listed, and picking it creates `projects/`:
 
 ```
 Move to which account on studio2?  (now in sigint on this machine)
@@ -214,7 +214,7 @@ After the move, it resumes the session on the other machine:
 | In [cmux](https://cmux.dev) | a `cmux ssh` workspace running `cd <dir> && claude --resume <id>` |
 | Anywhere else | the same command in this terminal, through `ssh -t` and a login shell |
 
-For an account other than `default`, the command sets `CLAUDE_CONFIG_DIR`, the same thing the launcher in [Add an account](#add-an-account) does.
+The command sets `CLAUDE_CONFIG_DIR` to the account's config dir, the same thing the launcher in [Add an account](#add-an-account) does, or clears it for `default`.
 
 `cmux session move` (cmux 0.65 and later) also moves a session to another machine, and carries the git checkout with it. It has no option to pick the account, so it can't move a session from one account to another the way this tool does.
 
