@@ -41,6 +41,9 @@ Options:
                     is still running, and on another machine stash uncommitted changes
                     in the checkout there instead of refusing.
     --no-code       On another machine, move the session but not its git checkout.
+    --resume        With <account>@<host>: after the move, open the session there as
+                    the picker does (a cmux ssh workspace, else ssh -t), instead of
+                    printing the command.
     --list          Print the picker's rows, with their section, and exit.
     -h, --help      This help.
 
@@ -1699,7 +1702,7 @@ def print_list() -> int:
 
 def main(argv):
     args = []
-    dry = force = listing = False
+    dry = force = listing = resume = False
     carry = True
     for a in argv:
         if a in ("-h", "--help"):
@@ -1713,6 +1716,8 @@ def main(argv):
             listing = True
         elif a == "--no-code":
             carry = False
+        elif a == "--resume":
+            resume = True
         elif a.startswith("-"):
             die(f"unknown option: {a}")
         else:
@@ -1728,10 +1733,13 @@ def main(argv):
     if target not in accounts():
         account, _, host = target.partition("@")
         if host and host != LOCAL:
-            return move_to_host(session_id, account, check_host(host), dry, force, carry)
+            return move_to_host(session_id, account, check_host(host), dry, force, carry,
+                                resume)
         target = account
     if target not in accounts():
         die(f"unknown account: {target} (one of {', '.join(accounts())})")
+    if resume:
+        die("--resume needs <account>@<host>: it opens the moved session on that machine.")
 
     cwd = move_session(session_id, target, dry, force)
     if cwd is not None:
@@ -1741,9 +1749,11 @@ def main(argv):
 
 
 def move_to_host(session_id: str, account: str, host: str, dry: bool, force: bool,
-                 carry: bool) -> int:
+                 carry: bool, resume: bool = False) -> int:
     dest = remote_dest(host, account)
     moved = move_session(session_id, account, dry, force, dest, carry)
+    if moved is not None and resume and not dry:
+        return resume_remote(dest, session_id, session_id[:8], *moved)
     if moved is not None:
         cwd, dir_ok = moved
         print(f"\ndone. resume with:  {ssh_t_text(host, remote_resume(dest, session_id, cwd))}")
