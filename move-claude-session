@@ -37,8 +37,10 @@ cmux, and only when the project directory exists there.
 
 Options:
     -n, --dry-run   Show what would happen; change nothing.
-    --force         Overwrite existing files at the destination, and move a session
-                    that is still running.
+    --force         Overwrite existing files at the destination, move a session that
+                    is still running, and on another machine stash uncommitted changes
+                    in the checkout there instead of refusing.
+    --no-code       On another machine, move the session but not its git checkout.
     --list          Print the picker's rows, with their section, and exit.
     -h, --help      This help.
 
@@ -54,7 +56,10 @@ What it moves (paths relative to the account's config dir):
 
 The transcript and subagent transcripts have each moved path rewritten to its new
 location, so persisted tool output still resolves. Nothing else is rewritten.
-The project's code does not move: check it out on the other machine yourself.
+
+On another machine the session's git checkout goes too, at the same absolute path:
+the commits the host lacks, HEAD on the same branch, and the working tree's
+modified, deleted and untracked (not ignored) files. The repo here is only read.
 """
 
 import functools
@@ -312,7 +317,8 @@ def delete_sources(moves) -> None:
               file=sys.stderr)
 
 
-def move_session(session_id: str, target: str, dry: bool, force: bool, dest=None):
+def move_session(session_id: str, target: str, dry: bool, force: bool, dest=None,
+                 carry: bool = True):
     """Move the session to `target`, or to the remote account `dest` when given.
     Returns the directory to resume from (with, for a remote, whether it exists
     there), or None on a dry run."""
@@ -332,7 +338,7 @@ def move_session(session_id: str, target: str, dry: bool, force: bool, dest=None
 
     proj = os.path.basename(os.path.dirname(src_jsonl))
     if dest is not None:
-        return move_remote(session_id, source, src_jsonl, proj, dest, dry, force)
+        return move_remote(session_id, source, src_jsonl, proj, dest, dry, force, carry)
     moves = plan_moves(session_id, account_root(source), account_root(target), proj)
 
     if dry:
@@ -578,12 +584,22 @@ def walk_tree(path: str):
             for n in dirs + files]
 
 
-def move_remote(session_id, source, src_jsonl, proj, dest, dry, force):
+def move_remote(session_id, source, src_jsonl, proj, dest, dry, force, carry=True):
+    cwd = resume_dir(src_jsonl, proj)
+    with tempfile.TemporaryDirectory(prefix="move-claude-session-") as scratch:
+        checkout = local_checkout(cwd, scratch) if carry else None
+        try:
+            return move_remote_with(session_id, source, src_jsonl, proj, dest, dry, force,
+                                    cwd, checkout)
+        except GitError as e:
+            die(f"git failed here: {e}. Nothing was deleted here.")
+
+
+def move_remote_with(session_id, source, src_jsonl, proj, dest, dry, force, cwd, checkout):
     host, account, root = dest
     src_root = account_root(source)
     moves = plan_moves(session_id, src_root, root, proj)
     rels = [os.path.relpath(src, src_root) for src, _ in moves]
-    cwd = resume_dir(src_jsonl, proj)
     code, lines, err = ssh_run(host, PREFLIGHT, [root, cwd, *rels])
     if code != 0 or "MCS-OK" not in lines:
         die(f"can't check {host}: {err}. Nothing changed.")
@@ -591,19 +607,24 @@ def move_remote(session_id, source, src_jsonl, proj, dest, dry, force):
         die(f"{host} is this machine: {root} is the account the session is in. Nothing changed.")
     clashes = [ln[len("MCS-EXISTS "):] for ln in lines if ln.startswith("MCS-EXISTS ")]
     dir_ok = "MCS-DIR yes" in lines
+    plan = plan_code(host, checkout, force) if checkout else None
 
     if dry:
         print(f"would move {session_id} from {source} ({src_root})"
               f" to {account} on {host} ({root}):")
         for rel in rels:
             print(f"  {rel}{'   (already there)' if rel in clashes else ''}")
-        if not dir_ok:
+        if plan:
+            print_code_plan(host, checkout, plan)
+        elif not dir_ok:
             print(f"\n{cwd} does not exist on {host}.")
         print("\n(dry run, nothing changed)")
         return None
     if clashes and not force:
         die(f"destination already exists on {host}: {root}/{clashes[0]} (use --force to overwrite)")
 
+    if plan:
+        carry_code(host, checkout, plan, session_id)
     title = read_label(src_jsonl)[1] or session_id
     before = {src: os.lstat(src).st_ino for src, _ in moves}
     stage = f"{root}/.move-claude-session-{session_id}.partial"
@@ -645,6 +666,488 @@ def move_remote(session_id, source, src_jsonl, proj, dest, dry, force):
     save_last(account, host)
     print(f"moved {title}: {source} → {account}@{host} ({len(moves)} items)")
     return cwd, "MCS-DIR yes" in lines
+
+
+# ---------------------------------------------------------------- the code
+#
+# A remote move carries the session's git checkout too, as `cmux session move`
+# does: HEAD on the same branch, then the working tree's changes laid over it.
+# The repo here is only read. Its working tree is snapshotted as a commit made with
+# a temporary index into a scratch object store whose alternates point at the
+# repo's objects, so nothing is written to the repo. A bundle of that commit, less
+# what the host's refs already hold, goes over ssh, and the host fetches it, checks
+# out HEAD and restores the snapshot over the working tree.
+
+GIT_SCRUB = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+             "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_PREFIX")
+# Options for commands that write the temporary index: no split index or fsmonitor,
+# which would put files in the repo's git dir.
+SNAPSHOT_OPTS = ("-c", "core.splitIndex=false", "-c", "core.fsmonitor=false",
+                 "-c", "core.untrackedCache=false")
+SNAPSHOT_IDENT = {f"GIT_{who}_{what}": value for who in ("AUTHOR", "COMMITTER")
+                  for what, value in (("NAME", "move-claude-session"),
+                                      ("EMAIL", "move-claude-session@localhost"))}
+
+
+class GitError(Exception):
+    pass
+
+
+def git(args, cwd=None, env=None, input=None, check=True) -> str:
+    """Run git here and return its stdout. Never takes optional locks, so a read
+    doesn't refresh the repo's index."""
+    full = {k: v for k, v in os.environ.items() if k not in GIT_SCRUB}
+    full["GIT_OPTIONAL_LOCKS"] = "0"
+    full.update(env or {})
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, env=full, capture_output=True,
+                           input=input.encode() if input is not None else None)
+    except OSError as e:
+        raise GitError(str(e)) from e
+    if check and r.returncode != 0:
+        lines = [ln for ln in r.stderr.decode(errors="replace").splitlines()
+                 if ln.strip() and not ln.startswith(("hint:", "warning:"))]
+        raise GitError((lines or [f"git {args[0]} exited {r.returncode}"])[0])
+    return r.stdout.decode(errors="surrogateescape")
+
+
+class Checkout:
+    """The git checkout a session ran in, with its working tree snapshotted."""
+
+    def __init__(self, top, gitdir, common, scratch):
+        self.top, self.common = top, common
+        self.repo = os.path.join(scratch, "snapshot.git")
+        self.scratch = scratch
+        self.head = git(["rev-parse", "-q", "--verify", "HEAD^{commit}"], top,
+                        check=False).strip()
+        if not self.head:
+            refuse_code(top, "has no commits yet")
+        ref = git(["symbolic-ref", "-q", "HEAD"], top, check=False).strip()
+        self.branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ""
+        self.linked = os.path.realpath(gitdir) != os.path.realpath(common)
+        self.main = (os.path.dirname(common)
+                     if self.linked and os.path.basename(common) == ".git" else "")
+        self.origin = git(["config", "--get", "remote.origin.url"], top, check=False).strip()
+        self.fmt = git(["rev-parse", "--show-object-format"], top, check=False).strip() or "sha1"
+        if gitlinks(git(["ls-files", "-s", "-z"], top)):
+            refuse_code(top, "has submodules, which this tool does not carry")
+        if git(["ls-files", "-z", ":(attr:filter=lfs)"], top).strip("\0"):
+            refuse_code(top, "uses Git LFS, which this tool does not carry")
+        self.skipped = []
+        self.tree, self.wip = self.snapshot(os.path.join(gitdir, "index"))
+
+    def snapshot(self, index):
+        git(["init", "-q", "--bare", f"--object-format={self.fmt}", self.repo])
+        objects = os.path.join(self.common, "objects")
+        with open(os.path.join(self.repo, "objects", "info", "alternates"), "w") as fh:
+            fh.write(objects + "\n")
+        env = {"GIT_INDEX_FILE": os.path.join(self.scratch, "index"),
+               "GIT_OBJECT_DIRECTORY": os.path.join(self.repo, "objects"),
+               "GIT_ALTERNATE_OBJECT_DIRECTORIES": objects}
+        try:   # a copy of the index keeps its stat cache: only changed files are hashed
+            shutil.copyfile(index, env["GIT_INDEX_FILE"])
+            git([*SNAPSHOT_OPTS, "add", "-A"], self.top, env)
+        except (OSError, GitError):
+            git([*SNAPSHOT_OPTS, "read-tree", "HEAD"], self.top, env)
+            git([*SNAPSHOT_OPTS, "add", "-A"], self.top, env)
+        # `add -A` records a repo nested in the working tree (an untracked clone, a
+        # worktree under .claude/worktrees) as a gitlink. It is not this repo's code.
+        self.skipped = gitlinks(git(["ls-files", "-s", "-z"], self.top, env))
+        if self.skipped:
+            git([*SNAPSHOT_OPTS, "update-index", "--force-remove", "--", *self.skipped],
+                self.top, env)
+        tree = git(["write-tree"], self.top, env).strip()
+        wip = git(["commit-tree", tree, "-p", self.head, "-m",
+                   "move-claude-session: the working tree"],
+                  self.top, {**env, **SNAPSHOT_IDENT}).strip()
+        self.git("update-ref", "refs/mcs/wip", wip)
+        return tree, wip
+
+    def git(self, *args, input=None, check=True) -> str:
+        """git on the snapshot store, which sees the repo's objects too."""
+        return git(["--git-dir", self.repo, *args], input=input, check=check)
+
+    def known(self, shas):
+        """The commits among these object names (peeled) that exist here."""
+        if not shas:
+            return []
+        out = self.git("cat-file", "--batch-check=%(objectname) %(objecttype)",
+                       input="".join(f"{s}^{{commit}}\n" for s in shas))
+        return sorted({ln.split()[0] for ln in out.splitlines() if ln.endswith(" commit")})
+
+    def is_ancestor(self, older, newer) -> bool:
+        try:
+            self.git("merge-base", "--is-ancestor", older, newer)
+            return True
+        except GitError:
+            return False
+
+    def commits(self, negs, limit):
+        """(how many commits the host lacks, the newest `limit` as one-liners)."""
+        revs = f"{self.head}\n--not\n" + "".join(f"{n}\n" for n in negs)
+        count = int(self.git("rev-list", "--count", "--stdin", input=revs).strip())
+        log = self.git("log", "--oneline", "--no-decorate", f"-n{limit}", "--stdin",
+                       input=revs).splitlines()
+        return count, log
+
+    def changes(self):
+        """[(status letter, path)] from HEAD to the working tree."""
+        out = self.git("diff-tree", "-r", "-z", "--no-renames", "--name-status",
+                       self.head, self.wip).split("\0")
+        return [(out[i], out[i + 1]) for i in range(0, len(out) - 1, 2)]
+
+    def bundle(self, negs) -> str:
+        path = os.path.join(self.scratch, "code.bundle")
+        self.git("bundle", "create", "-q", path, "--stdin",
+                 input="refs/mcs/wip\n" + "".join(f"^{n}\n" for n in negs))
+        return path
+
+    def where(self) -> str:
+        return f"{self.branch or 'detached HEAD'} at {self.head[:7]}"
+
+
+def gitlinks(ls_files_z: str):
+    """Paths of the gitlink (submodule) entries in `git ls-files -s -z` output."""
+    return [e.split("\t", 1)[1] for e in ls_files_z.split("\0") if e.startswith("160000 ")]
+
+
+def refuse_code(top: str, why: str) -> "NoReturn":
+    die(f"{top} {why}. Check it out on the other machine yourself and pass --no-code. "
+        "Nothing changed.")
+
+
+def local_checkout(cwd: str, scratch: str):
+    """The checkout cwd is in, or None when it isn't in one (or there is no git)."""
+    if not os.path.isdir(cwd) or not shutil.which("git"):
+        return None
+    try:
+        top, gitdir, common = git(["rev-parse", "--path-format=absolute", "--show-toplevel",
+                                   "--git-dir", "--git-common-dir"], cwd).splitlines()
+    except (GitError, ValueError):
+        return None   # not in a work tree
+    try:
+        return Checkout(top, gitdir, common, scratch)
+    except GitError as e:
+        die(f"can't read the git checkout in {top}: {e}. Nothing changed. "
+            "Pass --no-code to move the session without it.")
+
+
+# Shared by the probe and the apply. `dirty` prints the first uncommitted path,
+# leaving out repos nested in the working tree. `worktree_tree` hashes the working
+# tree the way the snapshot here does, into a temp store, writing nothing.
+GIT_SH = r"""export GIT_OPTIONAL_LOCKS=0
+tab=$(printf '\t')
+dirty() {
+  git -C "$1" status --porcelain --untracked-files=all | while IFS= read -r l; do
+    p=${l#???}
+    case $l in "?? "*/) [ -e "$1/${p}.git" ] && continue ;; esac
+    printf '%s\n' "$p"; break
+  done
+}
+worktree_tree() {
+  w=$(mktemp -d "${TMPDIR:-/tmp}/mcs.XXXXXX") || return 1
+  o=$(cd "$1" && cd "$(git rev-parse --git-common-dir)" && pwd -P)/objects
+  mkdir "$w/o"
+  (
+    export GIT_INDEX_FILE="$w/i" GIT_OBJECT_DIRECTORY="$w/o" GIT_ALTERNATE_OBJECT_DIRECTORIES="$o"
+    g() { git -c core.splitIndex=false -c core.fsmonitor=false -c core.untrackedCache=false "$@"; }
+    cd "$1" && g read-tree HEAD && g add -A >/dev/null 2>&1 &&
+    g ls-files -s | while IFS= read -r l; do
+      case $l in 160000*) g update-index --force-remove -- "${l#*"$tab"}" ;; esac
+    done && g write-tree
+  )
+  rm -rf "$w"
+}
+"""
+
+# What the host has at the checkout's path: MCS-AT top (a checkout of its own
+# there), main (no path, but the main repo of the worktree is there), other or
+# none, with the facts the plan needs.
+CODE_PROBE = r"""top=$1 main=$2 branch=$3
+command -v git >/dev/null 2>&1 || { echo MCS-NOGIT; exit 0; }
+is_top() {
+  [ -d "$1" ] && t=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) &&
+    [ "$(cd "$t" && pwd -P)" = "$(cd "$1" && pwd -P)" ]
+}
+facts() {
+  git -C "$1" for-each-ref --format='MCS-REF %(objectname)'
+  printf 'MCS-HEAD %s\n' "$(git -C "$1" rev-parse -q --verify 'HEAD^{commit}')"
+  printf 'MCS-CURRENT %s\n' "$(git -C "$1" symbolic-ref -q HEAD)"
+  [ -z "$branch" ] || printf 'MCS-BRANCH %s\n' "$(git -C "$1" rev-parse -q --verify "refs/heads/$branch")"
+  printf 'MCS-ORIGIN %s\n' "$(git -C "$1" config --get remote.origin.url)"
+}
+if is_top "$top"; then
+  echo MCS-AT top
+  facts "$top"
+  p=$(dirty "$top")
+  if [ -z "$p" ]; then
+    printf 'MCS-WTREE %s\n' "$(git -C "$top" rev-parse -q --verify 'HEAD^{tree}')"
+  else
+    printf 'MCS-DIRTY %s\n' "$p"
+    printf 'MCS-WTREE %s\n' "$(worktree_tree "$top")"
+  fi
+elif [ -e "$top" ] || [ -L "$top" ]; then
+  echo MCS-AT other
+elif [ -n "$main" ] && is_top "$main"; then
+  echo MCS-AT main
+  facts "$main"
+else
+  echo MCS-AT none
+fi
+echo MCS-OK"""
+
+# stdin: the bundle. Checks it arrived whole, then (mode) fetches into the checkout
+# at $top, adds a worktree of $main at $top, or makes a new repo at $top; checks
+# out HEAD, restores the snapshot over the working tree and checks the result.
+# Any failure after the first change puts the host back as it was, the stash it
+# made with --force included. Ignores HUP and PIPE, so a dropped connection can't
+# stop it halfway.
+CODE_APPLY = r"""top=$1 mode=$2 main=$3 branch=$4 head=$5 wip=$6 force=$7 stash=$8 origin=$9 fmt=${10} want=${11}
+trap '' HUP PIPE
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/mcs.XXXXXX") || { echo 'MCS-FAIL could not make a temp dir'; exit 1; }
+trap 'rm -rf "$tmp"' EXIT
+b=$tmp/code.bundle laid="" stashed="" bsha=""
+fail() { printf 'MCS-FAIL %s\n' "$1"; exit 1; }
+stuck() { printf 'MCS-STUCK %s\n' "$1"; exit 1; }
+err() { sed -e '/^hint:/d' -e '/^warning:/d' -e '/^[[:space:]]*$/d' "$tmp/err" | head -n 1; }
+run() { "$@" >/dev/null 2>"$tmp/err"; }
+cat > "$b"
+if command -v shasum >/dev/null 2>&1; then got=$(shasum -a 256 < "$b" | cut -c1-64)
+elif command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum < "$b" | cut -c1-64)
+else fail "no shasum or sha256sum to check the code with"; fi
+[ "$got" = "$want" ] || fail "the code did not arrive intact"
+ident() {
+  [ -n "$(git -C "$1" config user.name)" ] ||
+    export GIT_AUTHOR_NAME=move-claude-session GIT_COMMITTER_NAME=move-claude-session
+  [ -n "$(git -C "$1" config user.email)" ] ||
+    export GIT_AUTHOR_EMAIL=move-claude-session@localhost GIT_COMMITTER_EMAIL=move-claude-session@localhost
+}
+fetch() {
+  run git -C "$1" fetch -q --no-tags --no-write-fetch-head "$b" refs/mcs/wip || return 1
+  [ -n "$branch" ] || return 0
+  bsha=$(git -C "$1" rev-parse -q --verify "refs/heads/$branch")
+  if [ -n "$bsha" ] && [ "$bsha" != "$head" ] && ! git -C "$1" merge-base --is-ancestor "$bsha" "$head"; then
+    fail "$branch has commits on the host that it lacks here"
+  fi
+}
+checkout() {
+  if [ -n "$branch" ]; then run git -C "$1" checkout -q -B "$branch" "$head"
+  else run git -C "$1" checkout -q --detach "$head"; fi
+}
+verify() {
+  [ "$(git -C "$1" rev-parse -q --verify HEAD)" = "$head" ] || return 1
+  [ "$(git -C "$1" symbolic-ref -q HEAD)" = "${branch:+refs/heads/$branch}" ] || return 1
+  GIT_INDEX_FILE="$tmp/verify" git -C "$1" read-tree "$wip" || return 1
+  GIT_INDEX_FILE="$tmp/verify" git -C "$1" update-index -q --refresh >/dev/null
+  GIT_INDEX_FILE="$tmp/verify" git -C "$1" diff-files --quiet
+}
+lay() {
+  laid=1
+  run git -C "$1" restore -q --source="$wip" --worktree -- :/ || return 1
+  verify "$1" || { echo "the working tree did not come out as it is here" > "$tmp/err"; return 1; }
+}
+unlay() {
+  [ -n "$laid" ] || return 0
+  (cd "$1" && git diff --name-only -z --no-renames --diff-filter=A "$head" "$wip" | xargs -0 rm -f --)
+}
+undo_top() {
+  why=$1 bad=""
+  if [ -n "$branch" ] && [ -n "$bsha" ]; then git -C "$top" update-ref "refs/heads/$branch" "$bsha" || bad=1; fi
+  if [ -n "$oref" ]; then git -C "$top" checkout -q -f "${oref#refs/heads/}" -- >/dev/null 2>&1 || bad=1
+  elif [ -n "$orig" ]; then git -C "$top" checkout -q -f --detach "$orig" >/dev/null 2>&1 || bad=1; fi
+  if [ -n "$branch" ] && [ -z "$bsha" ] && [ "refs/heads/$branch" != "$oref" ]; then
+    git -C "$top" branch -q -D "$branch" >/dev/null 2>&1 || bad=1
+  fi
+  unlay "$top" || bad=1
+  if [ -n "$stashed" ]; then
+    git -C "$top" stash pop -q --index >/dev/null 2>&1 || git -C "$top" stash pop -q >/dev/null 2>&1 || bad=1
+  fi
+  note=""
+  [ -z "$stashed" ] || note="; its own changes are in the stash \"$stash\""
+  [ -z "$bad" ] || stuck "$why, and could not put $top back as it was$note"
+  fail "$why"
+}
+undo_new() {
+  why=$1
+  if [ "$mode" = worktree ]; then
+    git -C "$main" worktree remove -f -f "$top" >/dev/null 2>&1 || rm -rf "$top"
+    git -C "$main" worktree prune >/dev/null 2>&1
+    if [ -n "$branch" ] && [ -n "$bsha" ]; then
+      git -C "$main" update-ref "refs/heads/$branch" "$bsha" || stuck "$why, and could not put $branch back at $bsha"
+    elif [ -n "$branch" ] && git -C "$main" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+      git -C "$main" branch -q -D "$branch" >/dev/null 2>&1 || stuck "$why, and could not delete the branch $branch it made"
+    fi
+  else
+    rm -rf "$top"
+  fi
+  [ ! -e "$top" ] || stuck "$why, and could not remove $top"
+  fail "$why"
+}
+case $mode in
+top)
+  ident "$top"
+  fetch "$top" || fail "could not fetch the code into $top: $(err)"
+  p=$(dirty "$top")
+  [ -z "$p" ] || [ "$force" = 1 ] || fail "$top has uncommitted changes ($p)"
+  oref=$(git -C "$top" symbolic-ref -q HEAD) orig=$(git -C "$top" rev-parse -q --verify HEAD)
+  if [ -n "$p" ]; then
+    run git -C "$top" stash push -q -u -m "$stash" || fail "could not stash the changes in $top: $(err)"
+    stashed=1
+    printf 'MCS-STASHED %s\n' "$stash"
+  fi
+  { checkout "$top" && lay "$top"; } || undo_top "$(err)"
+  ;;
+worktree|clone)
+  { [ ! -e "$top" ] && [ ! -L "$top" ]; } || fail "$top appeared on the host since the check"
+  mkdir -p "$(dirname "$top")" || fail "could not create $(dirname "$top")"
+  if [ "$mode" = worktree ]; then
+    ident "$main"
+    fetch "$main" || fail "could not fetch the code into $main: $(err)"
+    if [ -n "$branch" ]; then run git -C "$main" worktree add -q -B "$branch" "$top" "$head"
+    else run git -C "$main" worktree add -q --detach "$top" "$head"; fi || undo_new "could not add a worktree at $top: $(err)"
+  else
+    run git init -q --object-format="$fmt" "$top" || undo_new "could not make a repo at $top: $(err)"
+    { fetch "$top" && checkout "$top" &&
+      { [ -z "$origin" ] || run git -C "$top" remote add origin "$origin"; }; } || undo_new "$(err)"
+  fi
+  lay "$top" || undo_new "$(err)"
+  ;;
+*) fail "unknown mode $mode" ;;
+esac
+echo MCS-CODE-DONE"""
+
+
+def plan_code(host: str, co: Checkout, force: bool) -> dict:
+    """How the checkout gets to host, from what the host has: a dict whose mode is
+    'same' (nothing to carry), 'top', 'worktree' or 'clone'. Dies on what it must
+    refuse, before anything is sent."""
+    code, lines, err = ssh_run(host, GIT_SH + CODE_PROBE, [co.top, co.main, co.branch])
+    if code != 0 or not {"MCS-OK", "MCS-NOGIT"} & set(lines):
+        die(f"can't check the code on {host}: {err}. Nothing changed.")
+    if "MCS-NOGIT" in lines:
+        die(f"{host} has no git, so the code in {co.top} can't go there. "
+            "Pass --no-code to move the session without it. Nothing changed.")
+    facts, refs = {}, []
+    for ln in lines:
+        key, _, val = ln.partition(" ")
+        if key == "MCS-REF":
+            refs.append(val)
+        else:
+            facts[key] = val
+    at = facts.get("MCS-AT")
+    plan = {"mode": "clone", "negs": [], "bsha": "", "dirty": "", "force": force}
+    if at == "other":
+        die(f"{co.top} exists on {host} and is not a checkout of this repo. Move it aside "
+            "there, or pass --no-code. Nothing changed.")
+    if at == "none":
+        if co.linked:
+            die(f"{co.top} is a worktree of {co.main or 'a repo'}, which is not on {host}. "
+                "Clone it there first, or pass --no-code. Nothing changed.")
+        return plan
+    there = co.top if at == "top" else co.main
+    plan["negs"] = co.known(refs)
+    if not plan["negs"] and not (co.origin and facts.get("MCS-ORIGIN") == co.origin):
+        die(f"{there} on {host} is a different repo: it shares no commits or origin with "
+            f"{co.top}. Nothing changed.")
+    plan["bsha"] = bsha = facts.get("MCS-BRANCH", "")
+    if co.branch and bsha and bsha != co.head and not co.is_ancestor(bsha, co.head):
+        die(f"{co.branch} on {host} has commits that it lacks here, so it can't be moved "
+            f"to {co.head[:7]} without losing them. Merge or push them first, or pass "
+            "--no-code. Nothing changed.")
+    if at == "main":
+        plan["mode"] = "worktree"
+        return plan
+    current = f"refs/heads/{co.branch}" if co.branch else ""
+    if (facts.get("MCS-HEAD") == co.head and facts.get("MCS-CURRENT") == current
+            and facts.get("MCS-WTREE") == co.tree):
+        plan["mode"] = "same"
+        return plan
+    plan["mode"], plan["dirty"] = "top", facts.get("MCS-DIRTY", "")
+    if plan["dirty"] and not force:
+        die(f"{co.top} on {host} has uncommitted changes ({plan['dirty']}). Commit them "
+            "there, or pass --force to stash them there first. Nothing changed.")
+    return plan
+
+
+def code_summary(host: str, co: Checkout, plan: dict) -> str:
+    how = {"same": "is already there, with the same changes",
+           "clone": f"is not on {host}: a new repo is made there"
+                    + (f", origin {co.origin}" if co.origin else ""),
+           "worktree": f"is not on {host}: it is added as a worktree of {co.main}"}
+    if plan["mode"] in how:
+        return how[plan["mode"]]
+    if not co.branch:
+        return f"is checked out there detached at {co.head[:7]}"
+    if not plan["bsha"]:
+        return f"is checked out there on a new branch {co.branch}"
+    if plan["bsha"] != co.head:
+        return f"is checked out there, fast-forwarding {co.branch} from {plan['bsha'][:7]}"
+    return f"is checked out there on {co.branch}"
+
+
+def print_code_plan(host: str, co: Checkout, plan: dict) -> None:
+    print(f"\nwould carry the code in {co.top} ({co.where()}). It {code_summary(host, co, plan)}.")
+    if plan["mode"] == "same":
+        return
+    if plan["dirty"]:
+        print(f"Its uncommitted changes there are stashed first ({plan['dirty']}, ...).")
+    count, log = co.commits(plan["negs"], 10)
+    print(f"  {count} commit{'s' * (count != 1)} to send")
+    for line in log:
+        print(f"    {line}")
+    if count > len(log):
+        print(f"    ... and {count - len(log)} more")
+    changes = co.changes()
+    print(f"  {len(changes)} changed file{'s' * (len(changes) != 1)}")
+    for status, path in changes[:30]:
+        print(f"    {status}  {path}")
+    if len(changes) > 30:
+        print(f"    ... and {len(changes) - 30} more")
+    for path in co.skipped:
+        print(f"  skipped {path}: a repo of its own")
+
+
+def carry_code(host: str, co: Checkout, plan: dict, session_id: str) -> None:
+    """Send the checkout to host and lay it out there, or die with the session
+    untouched here."""
+    for path in co.skipped:
+        print(f"skipped {path}: a repo of its own, not carried")
+    if plan["mode"] == "same":
+        print(f"code: {co.top} ({co.where()}) is already on {host}")
+        return
+    bundle = co.bundle(plan["negs"])
+    digest = hashlib.sha256()
+    with open(bundle, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    digest = digest.hexdigest()
+    stash = f"move-claude-session {session_id} {time.strftime('%Y-%m-%d %H:%M')}"
+
+    def feed(fh):
+        with open(bundle, "rb") as src:
+            shutil.copyfileobj(src, fh)
+    try:
+        code, lines, err = ssh_run(host, GIT_SH + CODE_APPLY,
+                                   [co.top, plan["mode"], co.main, co.branch, co.head, co.wip,
+                                    "1" if plan["force"] else "0", stash, co.origin, co.fmt,
+                                    digest], feed=feed, timeout=None)
+    except KeyboardInterrupt:
+        lines, err = [], "interrupted"
+    if "MCS-CODE-DONE" not in lines:
+        failed = next((ln[len("MCS-FAIL "):] for ln in lines if ln.startswith("MCS-FAIL ")), None)
+        if failed:
+            die(f"carrying the code to {host} failed, nothing changed: {failed}")
+        stuck = next((ln[len("MCS-STUCK "):] for ln in lines if ln.startswith("MCS-STUCK ")), None)
+        if stuck:
+            die(f"carrying the code to {host} failed: {stuck}. The session was not moved.")
+        die(f"could not confirm the code reached {host} ({err}). The session was not moved. "
+            f"On {host} the checkout either finished or was put back: run the same move again.")
+    if any(ln.startswith("MCS-STASHED ") for ln in lines):
+        print(f"stashed the uncommitted changes in {co.top} on {host} as \"{stash}\"")
+    count = co.commits(plan["negs"], 0)[0]
+    files = len(co.changes())
+    print(f"carried the code to {host}: {co.where()}, {count} commit{'s' * (count != 1)}, "
+          f"{files} changed file{'s' * (files != 1)}")
 
 
 def remote_is_here(preflight_lines, src_root: str) -> bool:
@@ -1102,7 +1605,7 @@ def choose_machine():
     return None if j is None else machines[j]
 
 
-def interactive_remote(row, host: str, dry: bool, force: bool) -> int:
+def interactive_remote(row, host: str, dry: bool, force: bool, carry: bool) -> int:
     home, found = remote_accounts(host)
     targets = list(found)
     rows = [[(f"{a:<10}", f"acct{n % 4}"),
@@ -1115,13 +1618,13 @@ def interactive_remote(row, host: str, dry: bool, force: bool) -> int:
     if target is None:
         return 1
     dest = remote_dest(host, target)
-    moved = move_session(row["id"], target, dry, force, dest)
+    moved = move_session(row["id"], target, dry, force, dest, carry)
     if moved is None:
         return 0
     return resume_remote(dest, row["id"], row["title"], *moved)
 
 
-def interactive(dry: bool, force: bool) -> int:
+def interactive(dry: bool, force: bool, carry: bool) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         die("the picker needs a terminal. Pass <session_id> <account> instead.")
     rows = candidates(force)
@@ -1139,7 +1642,7 @@ def interactive(dry: bool, force: bool) -> int:
     if machine is None:
         return 1
     if machine != LOCAL:
-        return interactive_remote(row, machine, dry, force)
+        return interactive_remote(row, machine, dry, force, carry)
     targets = [a for a in accounts() if a != row["account"]]
     if not targets:
         die("only one Claude Code account found, nowhere to move to")
@@ -1174,6 +1677,7 @@ def print_list() -> int:
 def main(argv):
     args = []
     dry = force = listing = False
+    carry = True
     for a in argv:
         if a in ("-h", "--help"):
             print(__doc__)
@@ -1184,6 +1688,8 @@ def main(argv):
             force = True
         elif a == "--list":
             listing = True
+        elif a == "--no-code":
+            carry = False
         elif a.startswith("-"):
             die(f"unknown option: {a}")
         else:
@@ -1192,14 +1698,14 @@ def main(argv):
     if listing:
         return print_list()
     if not args:
-        return interactive(dry, force)
+        return interactive(dry, force, carry)
     if len(args) != 2:
         die("usage: move-claude-session [<session_id> <account>[@<host>]]. Try --help.")
     session_id, target = args
     if target not in accounts():
         account, _, host = target.partition("@")
         if host and host != LOCAL:
-            return move_to_host(session_id, account, check_host(host), dry, force)
+            return move_to_host(session_id, account, check_host(host), dry, force, carry)
         target = account
     if target not in accounts():
         die(f"unknown account: {target} (one of {', '.join(accounts())})")
@@ -1211,9 +1717,10 @@ def main(argv):
 
 
 
-def move_to_host(session_id: str, account: str, host: str, dry: bool, force: bool) -> int:
+def move_to_host(session_id: str, account: str, host: str, dry: bool, force: bool,
+                 carry: bool) -> int:
     dest = remote_dest(host, account)
-    moved = move_session(session_id, account, dry, force, dest)
+    moved = move_session(session_id, account, dry, force, dest, carry)
     if moved is not None:
         cwd, dir_ok = moved
         print(f"\ndone. resume with:  {ssh_t_text(host, remote_resume(dest, session_id, cwd))}")

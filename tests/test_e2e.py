@@ -40,6 +40,8 @@ class Harness(unittest.TestCase):
         os.makedirs(self.remotes)
         self.env = fixture.env_for(self.home)
         self.env["FAKE_REMOTES"] = self.remotes
+        # git must not find a repo above the temp dir, or read this machine's config.
+        self.env.update(GIT_CEILING_DIRECTORIES=self.tmp, GIT_CONFIG_NOSYSTEM="1")
         self.env["PATH"] = bindir + os.pathsep + self.env.get("PATH", "/usr/bin:/bin")
 
     def tearDown(self):
@@ -364,8 +366,8 @@ class E2E(Harness):
         self.assertFalse(os.path.exists(os.path.join(self.remotes, "ssh.log")))
 
 
-class Remote(Harness):
-    """Moves to another machine, through the fake ssh in tests/fixture.py."""
+class RemoteHarness(Harness):
+    """A fake host, studio2, reached through the fake ssh in tests/fixture.py."""
 
     def setUp(self):
         super().setUp()
@@ -408,6 +410,10 @@ class Remote(Harness):
         self.assertTrue(os.path.isdir(os.path.join(self.home, ".claude", "file-history", sid)))
         with open(self.paths[sid]) as fh:
             self.assertNotIn(self.studio, fh.read())
+
+
+class Remote(RemoteHarness):
+    """Moves to another machine."""
 
     # ------------------------------------------------------------ picker
 
@@ -668,6 +674,385 @@ class Remote(Harness):
         self.assert_untouched_here(S[4])
         self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
         self.assertEqual(sorted(os.listdir(os.path.join(self.studio, ".claude-sigint"))), ["projects"])
+
+
+class Code(RemoteHarness):
+    """A remote move carries the session's git checkout. The host's copy of a
+    project lives under the remote home, mapped from the same absolute path here."""
+
+    def setUp(self):
+        super().setUp()
+        with open(os.path.join(self.remotes, "studio2.map"), "w") as fh:
+            fh.write(f"{self.home}/code {self.studio}/code\n")
+        self.repo = self.make_repo("dotfiles")   # S[4]'s project, in the default account
+
+    # ------------------------------------------------------------ helpers
+
+    def git(self, cwd, *args):
+        env = {k: v for k, v in self.env.items() if not k.startswith("GIT_")}
+        env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CEILING_DIRECTORIES=self.tmp)
+        r = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                            "-c", "init.defaultBranch=main", *args],
+                           cwd=cwd, env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise AssertionError(f"git {' '.join(args)}: {r.stderr}")
+        return r.stdout.strip()
+
+    def make_repo(self, proj):
+        repo = os.path.join(self.home, "code", proj)
+        self.origin = os.path.join(self.tmp, f"{proj}.git")
+        self.git(self.tmp, "init", "-q", "--bare", self.origin)
+        self.git(repo, "init", "-q")
+        self.write(repo, ".gitignore", "*.log\n")
+        for name in ("a.txt", "b.txt", "c.txt"):
+            self.write(repo, name, f"{name} 1\n")
+        self.commit(repo, "first")
+        self.git(repo, "remote", "add", "origin", self.origin)
+        self.git(repo, "push", "-q", "origin", "main")
+        return repo
+
+    def write(self, repo, name, text):
+        path = os.path.join(repo, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(text)
+
+    def read(self, repo, name):
+        with open(os.path.join(repo, name)) as fh:
+            return fh.read()
+
+    def commit(self, repo, msg, name="a.txt"):
+        if msg != "first":
+            self.write(repo, name, f"{msg}\n")
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-q", "-m", msg)
+        return self.head(repo)
+
+    def head(self, repo):
+        return self.git(repo, "rev-parse", "HEAD")
+
+    def host_path(self, proj="dotfiles"):
+        return os.path.join(self.studio, "code", proj)
+
+    def host_clone(self, proj="dotfiles"):
+        self.git(self.tmp, "clone", "-q", self.origin, self.host_path(proj))
+        return self.host_path(proj)
+
+    def git_state(self, git_dir):
+        """Every file under a .git dir with its content, to show nothing was written."""
+        state = {}
+        for d, _, files in os.walk(git_dir):
+            for f in files:
+                path = os.path.join(d, f)
+                with open(path, "rb") as fh:
+                    state[os.path.relpath(path, git_dir)] = fh.read()
+        return state
+
+    def applied(self):
+        return "MCS-CODE-DONE" in self.ssh_log()
+
+    def move(self, *extra):
+        return self.run_cli(S[4], "sigint@studio2", *extra)
+
+    def fail_host_git_on(self, word):
+        with open(os.path.join(self.remotes, "studio2.git-fail"), "w") as fh:
+            fh.write(word)
+
+    # ------------------------------------------------------------ carrying it
+
+    def test_a_clean_repo_at_the_same_commit_is_left_as_it_is(self):
+        host = self.host_clone()
+        before = self.git_state(os.path.join(host, ".git"))
+        r = self.move()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("is already on studio2", r.stdout)
+        self.assertFalse(self.applied())
+        self.assertEqual(self.git_state(os.path.join(host, ".git")), before)
+        self.assertIsNotNone(self.remote_transcript(".claude-sigint", S[4]))
+
+    def test_new_commits_are_carried_and_the_branch_fast_forwarded(self):
+        host = self.host_clone()
+        self.commit(self.repo, "second")
+        head = self.commit(self.repo, "third")
+        r = self.move()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("carried the code to studio2: main at", r.stdout)
+        self.assertIn("2 commits", r.stdout)
+        self.assertEqual(self.head(host), head)
+        self.assertEqual(self.git(host, "symbolic-ref", "HEAD"), "refs/heads/main")
+        self.assertEqual(self.git(host, "status", "--porcelain"), "")
+
+    def test_modified_untracked_staged_and_deleted_files_are_carried(self):
+        host = self.host_clone()
+        self.write(self.repo, "a.txt", "changed here\n")
+        os.remove(os.path.join(self.repo, "b.txt"))
+        self.write(self.repo, "notes/new.txt", "untracked\n")
+        self.write(self.repo, "staged.txt", "staged\n")
+        self.git(self.repo, "add", "staged.txt")
+        self.write(self.repo, "debug.log", "ignored\n")
+        status = self.git(self.repo, "status", "--porcelain")
+        before = self.git_state(os.path.join(self.repo, ".git"))
+        r = self.move()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("4 changed files", r.stdout)
+        self.assertEqual(self.read(host, "a.txt"), "changed here\n")
+        self.assertFalse(os.path.exists(os.path.join(host, "b.txt")))
+        self.assertEqual(self.read(host, "notes/new.txt"), "untracked\n")
+        self.assertEqual(self.read(host, "staged.txt"), "staged\n")
+        self.assertFalse(os.path.exists(os.path.join(host, "debug.log")))
+        self.assertEqual(self.head(host), self.head(self.repo))
+        # The repo here is only read: not one byte under .git changes, nor its status.
+        self.assertEqual(self.git_state(os.path.join(self.repo, ".git")), before)
+        self.assertEqual(self.git(self.repo, "status", "--porcelain"), status)
+
+    def test_a_repo_missing_on_the_host_is_made_from_the_bundle(self):
+        self.commit(self.repo, "second")
+        self.write(self.repo, "wip.txt", "wip\n")
+        r = self.move()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        host = self.host_path()
+        self.assertEqual(self.head(host), self.head(self.repo))
+        self.assertEqual(self.git(host, "symbolic-ref", "HEAD"), "refs/heads/main")
+        self.assertEqual(self.git(host, "remote", "get-url", "origin"), self.origin)
+        self.assertEqual(self.read(host, "wip.txt"), "wip\n")
+        self.assertEqual(self.git(host, "rev-list", "--count", "HEAD"), "2")
+
+    def test_a_detached_head_stays_detached(self):
+        host = self.host_clone()
+        head = self.commit(self.repo, "second")
+        self.git(self.repo, "checkout", "-q", "--detach")
+        r = self.move()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.head(host), head)
+        self.assertEqual(self.git(host, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
+        self.assertNotEqual(self.git(host, "rev-parse", "main"), head)   # main not moved
+
+    def test_a_linked_worktree_is_added_beside_the_main_repo_there(self):
+        main = os.path.join(self.home, "code", "dotfiles-main")
+        shutil.move(self.repo, main)
+        self.git(main, "worktree", "add", "-q", "-b", "feat", self.repo)
+        head = self.commit(self.repo, "on feat")
+        self.write(self.repo, "wip.txt", "wip\n")
+        before = self.git_state(os.path.join(main, ".git"))
+        host_main = self.host_clone("dotfiles-main")
+        r = self.move()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        host = self.host_path()
+        self.assertEqual(self.head(host), head)
+        self.assertEqual(self.git(host, "symbolic-ref", "HEAD"), "refs/heads/feat")
+        self.assertEqual(self.read(host, "wip.txt"), "wip\n")
+        self.assertIn(host, self.git(host_main, "worktree", "list"))
+        self.assertEqual(self.git_state(os.path.join(main, ".git")), before)
+
+    def test_a_linked_worktree_whose_main_repo_is_not_there_is_refused(self):
+        main = os.path.join(self.home, "code", "dotfiles-main")
+        shutil.move(self.repo, main)
+        self.git(main, "worktree", "add", "-q", "-b", "feat", self.repo)
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f"is a worktree of {main}, which is not on studio2", r.stderr)
+        self.assertNotIn("tar -x", self.ssh_log())
+        self.assert_untouched_here(S[4])
+
+    def test_a_repo_nested_in_the_working_tree_is_skipped(self):
+        self.host_clone()
+        nested = os.path.join(self.repo, "vendor", "lib")
+        self.git(self.tmp, "init", "-q", nested)
+        self.commit(nested, "nested")
+        r = self.move()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("skipped vendor/lib: a repo of its own", r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.host_path(), "vendor")))
+
+    # ------------------------------------------------------------ refusing
+
+    def test_a_host_with_uncommitted_changes_is_refused_and_force_stashes_them(self):
+        host = self.host_clone()
+        self.write(host, "a.txt", "edited on the host\n")
+        head = self.commit(self.repo, "second", name="c.txt")
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("has uncommitted changes (a.txt)", r.stderr)
+        self.assertIn("--force", r.stderr)
+        self.assertFalse(self.applied())
+        self.assertEqual(self.read(host, "a.txt"), "edited on the host\n")
+        self.assert_untouched_here(S[4])
+        r = self.move("--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f'as "move-claude-session {S[4]}', r.stdout)
+        self.assertEqual(self.head(host), head)
+        self.assertEqual(self.read(host, "a.txt"), "a.txt 1\n")
+        self.assertIn(f"move-claude-session {S[4]}", self.git(host, "stash", "list"))
+        self.assertIn("edited on the host", self.git(host, "stash", "show", "-p"))
+
+    def test_a_diverged_branch_on_the_host_is_refused_even_with_force(self):
+        host = self.host_clone()
+        theirs = self.commit(host, "made on the host", name="c.txt")
+        self.commit(self.repo, "made here")
+        r = self.move("--force")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("main on studio2 has commits that it lacks here", r.stderr)
+        self.assertFalse(self.applied())
+        self.assertEqual(self.head(host), theirs)
+        self.assert_untouched_here(S[4])
+
+    def test_a_host_branch_ahead_of_this_one_is_refused(self):
+        host = self.host_clone()
+        ahead = self.commit(host, "only on the host")
+        r = self.move("--force")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("has commits that it lacks here", r.stderr)
+        self.assertEqual(self.head(host), ahead)
+
+    def test_a_path_that_is_not_this_repo_on_the_host_is_refused(self):
+        self.write(self.host_path(), "readme", "something else\n")
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("exists on studio2 and is not a checkout of this repo", r.stderr)
+        shutil.rmtree(self.host_path())
+        other = self.host_path()
+        self.git(self.tmp, "init", "-q", other)
+        self.commit(other, "unrelated", name="x")
+        r = self.move("--force")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("is a different repo", r.stderr)
+        self.assertFalse(self.applied())
+        self.assert_untouched_here(S[4])
+
+    def test_submodules_and_lfs_are_refused_before_anything_is_sent(self):
+        sha = self.head(self.repo)
+        self.git(self.repo, "update-index", "--add", "--cacheinfo", f"160000,{sha},sub")
+        self.git(self.repo, "commit", "-q", "-m", "submodule")
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("has submodules", r.stderr)
+        self.assertIn("--no-code", r.stderr)
+        self.assertNotIn("MCS-AT", self.ssh_log())
+        self.git(self.repo, "reset", "-q", "--hard", "HEAD~1")
+        self.write(self.repo, ".gitattributes", "*.bin filter=lfs diff=lfs merge=lfs -text\n")
+        self.write(self.repo, "x.bin", "data\n")
+        self.commit(self.repo, "lfs", name="c.txt")
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("uses Git LFS", r.stderr)
+        self.assertNotIn("MCS-AT", self.ssh_log())
+        self.assert_untouched_here(S[4])
+
+    # ------------------------------------------------------------ failures
+
+    def test_a_failed_checkout_on_the_host_puts_it_back_as_it_was(self):
+        host = self.host_clone()
+        before = self.head(host)
+        self.write(host, "a.txt", "edited on the host\n")
+        self.commit(self.repo, "second", name="c.txt")
+        self.write(self.repo, "new.txt", "new\n")
+        self.fail_host_git_on("restore")
+        r = self.move("--force")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("nothing changed", r.stderr)
+        self.assertIn("injected failure", r.stderr)
+        self.assertEqual(self.head(host), before)
+        self.assertEqual(self.git(host, "rev-parse", "main"), before)
+        self.assertEqual(self.read(host, "a.txt"), "edited on the host\n")
+        self.assertEqual(self.git(host, "status", "--porcelain"), "M a.txt")
+        self.assertEqual(self.git(host, "stash", "list"), "")
+        self.assert_untouched_here(S[4])
+        self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
+
+    def test_a_failed_new_repo_on_the_host_is_removed(self):
+        self.fail_host_git_on("restore")
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("nothing changed", r.stderr)
+        self.assertFalse(os.path.exists(self.host_path()))
+        self.assert_untouched_here(S[4])
+
+    def test_a_dropped_connection_while_carrying_the_code_keeps_the_session(self):
+        host = self.host_clone()
+        before = self.head(host)
+        self.commit(self.repo, "second")
+        with open(os.path.join(self.remotes, "studio2.drop-on"), "w") as fh:
+            fh.write("MCS-CODE-DONE")
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.head(host), before)   # the upload was cut, so it never applied
+        self.assert_untouched_here(S[4])
+
+    def test_a_rerun_after_the_session_failed_to_land_finds_the_code_there(self):
+        host = self.host_clone()
+        head = self.commit(self.repo, "second")
+        self.write(self.repo, "wip.txt", "wip\n")
+        open(os.path.join(self.remotes, "studio2.corrupt"), "w").close()
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("did not arrive intact", r.stderr)
+        self.assertIn("carried the code", r.stdout)
+        self.assertEqual(self.head(host), head)
+        self.assert_untouched_here(S[4])
+        os.remove(os.path.join(self.remotes, "studio2.corrupt"))
+        r = self.move()   # the host now has uncommitted changes: the ones carried
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("is already on studio2", r.stdout)
+        self.assertIsNotNone(self.remote_transcript(".claude-sigint", S[4]))
+
+    # ------------------------------------------------------------ options
+
+    def test_no_code_moves_only_the_session(self):
+        host = self.host_clone()
+        before = self.head(host)
+        self.commit(self.repo, "second")
+        self.write(self.repo, "wip.txt", "wip\n")
+        r = self.move("--no-code")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("MCS-AT", self.ssh_log())
+        self.assertEqual(self.head(host), before)
+        self.assertFalse(os.path.exists(os.path.join(host, "wip.txt")))
+        self.assertIsNotNone(self.remote_transcript(".claude-sigint", S[4]))
+
+    def test_a_folder_that_is_not_a_repo_moves_as_before(self):
+        r = self.run_cli(S[1], "sigint@studio2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("MCS-AT", self.ssh_log())
+        self.assertNotIn("carried the code", r.stdout)
+
+    def test_dry_run_lists_the_commits_and_files_and_changes_nothing(self):
+        host = self.host_clone()
+        before = self.head(host)
+        self.commit(self.repo, "second")
+        self.commit(self.repo, "third")
+        self.write(self.repo, "a.txt", "changed\n")
+        os.remove(os.path.join(self.repo, "b.txt"))
+        self.write(self.repo, "new.txt", "new\n")
+        r = self.move("-n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"would carry the code in {self.repo} (main at", r.stdout)
+        self.assertIn("fast-forwarding main from", r.stdout)
+        self.assertIn("2 commits to send", r.stdout)
+        self.assertIn(" third\n", r.stdout)
+        self.assertIn("3 changed files", r.stdout)
+        for line in ("M  a.txt", "D  b.txt", "A  new.txt"):
+            self.assertIn(line, r.stdout)
+        self.assertFalse(self.applied())
+        self.assertNotIn("tar -x", self.ssh_log())
+        self.assertEqual(self.head(host), before)
+        self.assert_untouched_here(S[4])
+
+    PICK_STUDIO2_SIGINT = [("which session", ENTER), ("which machine", DOWN + DOWN + ENTER),
+                           ("account on studio2", DOWN + DOWN + ENTER)]
+
+    def test_the_picker_carries_the_code_and_resumes_there(self):
+        repo = self.make_repo("billing-api")   # S[1], the row the picker starts on
+        code, out = self.run_picker(self.PICK_STUDIO2_SIGINT)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.head(self.host_path("billing-api")), self.head(repo))
+        self.assertEqual(self.cmux_launched()[:2], ["ssh", "studio2"])
+
+    def test_the_picker_passes_no_code_through(self):
+        self.make_repo("billing-api")
+        code, out = self.run_picker(self.PICK_STUDIO2_SIGINT, "--no-code")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.host_path("billing-api")))
+        self.assertIn("does not exist on studio2", out)
 
 
 if __name__ == "__main__":
