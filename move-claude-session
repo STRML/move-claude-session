@@ -845,8 +845,11 @@ def local_checkout(cwd: str, scratch: str):
 GIT_SH = r"""export GIT_OPTIONAL_LOCKS=0
 tab=$(printf '\t')
 dirty() {
-  git -C "$1" status --porcelain --untracked-files=all | while IFS= read -r l; do
+  s=$(git -C "$1" status --porcelain --untracked-files=all 2>/dev/null) ||
+    { echo "git status failed there"; return; }
+  printf '%s\n' "$s" | while IFS= read -r l; do
     p=${l#???}
+    [ -n "$l" ] || continue
     case $l in "?? "*/) [ -e "$1/${p}.git" ] && continue ;; esac
     printf '%s\n' "$p"; break
   done
@@ -861,7 +864,7 @@ worktree_tree() {
     cd "$1" && g read-tree HEAD && g add -A >/dev/null 2>&1 &&
     g ls-files -s | while IFS= read -r l; do
       case $l in 160000*) g update-index --force-remove -- "${l#*"$tab"}" ;; esac
-    done && g write-tree
+    done && ! g ls-files -s | grep -q '^160000' && g write-tree
   )
   rm -rf "$w"
 }
@@ -938,8 +941,8 @@ fetch() {
   fi
 }
 checkout() {
-  if [ -n "$branch" ]; then run git -C "$1" checkout -q -B "$branch" "$head"
-  else run git -C "$1" checkout -q --detach "$head"; fi
+  if [ -n "$branch" ]; then run git -C "$1" checkout -q --no-overwrite-ignore -B "$branch" "$head"
+  else run git -C "$1" checkout -q --no-overwrite-ignore --detach "$head"; fi
 }
 verify() {
   [ "$(git -C "$1" rev-parse -q --verify HEAD)" = "$head" ] || return 1
@@ -955,15 +958,17 @@ lay() {
 }
 unlay() {
   [ -n "$laid" ] || return 0
-  (cd "$1" && git diff --name-only -z --no-renames --diff-filter=A "$head" "$wip" | xargs -0 rm -f --)
+  (cd "$1" && git diff --name-only -z --no-renames --diff-filter=A "$base" "$wip" | xargs -0 rm -f --)
 }
 undo_top() {
   why=$1 bad=""
   if [ -n "$branch" ] && [ -n "$bsha" ]; then git -C "$top" update-ref "refs/heads/$branch" "$bsha" || bad=1; fi
-  if [ -n "$oref" ]; then git -C "$top" checkout -q -f "${oref#refs/heads/}" -- >/dev/null 2>&1 || bad=1
-  elif [ -n "$orig" ]; then git -C "$top" checkout -q -f --detach "$orig" >/dev/null 2>&1 || bad=1; fi
-  if [ -n "$branch" ] && [ -z "$bsha" ] && [ "refs/heads/$branch" != "$oref" ]; then
-    git -C "$top" branch -q -D "$branch" >/dev/null 2>&1 || bad=1
+  if [ -z "$orig" ]; then
+    { git -C "$top" symbolic-ref HEAD "$oref" && git -C "$top" read-tree --empty; } || bad=1
+  elif [ -n "$oref" ]; then git -C "$top" checkout -q -f "${oref#refs/heads/}" -- >/dev/null 2>&1 || bad=1
+  else git -C "$top" checkout -q -f --detach "$orig" >/dev/null 2>&1 || bad=1; fi
+  if [ -n "$branch" ] && [ -z "$bsha" ]; then
+    git -C "$top" update-ref -d "refs/heads/$branch" || bad=1
   fi
   unlay "$top" || bad=1
   if [ -n "$stashed" ]; then
@@ -997,12 +1002,13 @@ top)
   fetch "$top" || fail "could not fetch the code into $top: $(err)"
   p=$(dirty "$top")
   [ -z "$p" ] || [ "$force" = 1 ] || fail "$top has uncommitted changes ($p)"
-  # A file the snapshot adds that the host has as an ignored file would be
-  # overwritten, and no stash holds it. Refuse rather than lose it.
-  ign=$(cd "$top" && git diff --name-only -z --no-renames --diff-filter=A "$head" "$wip" |
+  oref=$(git -C "$top" symbolic-ref -q HEAD) orig=$(git -C "$top" rev-parse -q --verify HEAD)
+  base=${orig:-$(git -C "$top" hash-object -t tree /dev/null)}
+  # A file the move adds (in the carried commits or the working tree) that the
+  # host has as an ignored file would be overwritten, and no stash holds it.
+  ign=$(cd "$top" && git diff --name-only -z --no-renames --diff-filter=A "$base" "$wip" |
     xargs -0 sh -c 'for p; do { [ -e "$p" ] || [ -L "$p" ]; } && git check-ignore -q -- "$p" && { printf "%s\n" "$p"; break; }; done' sh)
   [ -z "$ign" ] || fail "$top/$ign exists on the host as an ignored file, and the move would overwrite it"
-  oref=$(git -C "$top" symbolic-ref -q HEAD) orig=$(git -C "$top" rev-parse -q --verify HEAD)
   if [ -n "$p" ]; then
     run git -C "$top" stash push -q -u -m "$stash" || fail "could not stash the changes in $top: $(err)"
     stashed=1
@@ -1012,12 +1018,14 @@ top)
   ;;
 worktree|clone)
   { [ ! -e "$top" ] && [ ! -L "$top" ]; } || fail "$top appeared on the host since the check"
+  if [ "$mode" = worktree ]; then
+    ident "$main"
+    fetch "$main" || fail "could not fetch the code into $main: $(err)"
+  fi
   made="" d=$(dirname "$top")
   while [ ! -e "$d" ]; do made=$d d=$(dirname "$d"); done
   mkdir -p "$(dirname "$top")" || fail "could not create $(dirname "$top")"
   if [ "$mode" = worktree ]; then
-    ident "$main"
-    fetch "$main" || fail "could not fetch the code into $main: $(err)"
     if [ -n "$branch" ]; then run git -C "$main" worktree add -q -B "$branch" "$top" "$head"
     else run git -C "$main" worktree add -q --detach "$top" "$head"; fi || undo_new "could not add a worktree at $top: $(err)"
   else

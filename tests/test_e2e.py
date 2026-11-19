@@ -931,6 +931,27 @@ class Code(RemoteHarness):
         self.assertEqual(self.read(host, "secret.txt"), "only on the host\n")
         self.assert_untouched_here(S[4])
 
+    def test_an_ignored_file_a_carried_commit_adds_is_not_overwritten(self):
+        host = self.host_clone()
+        with open(os.path.join(host, ".git", "info", "exclude"), "a") as fh:
+            fh.write("secret.txt\n")
+        self.write(host, "secret.txt", "only on the host\n")
+        self.commit(self.repo, "add secret", name="secret.txt")
+        r = self.move("--force")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("secret.txt exists on the host as an ignored file", r.stderr)
+        self.assertEqual(self.read(host, "secret.txt"), "only on the host\n")
+
+    def test_a_host_whose_git_status_fails_is_not_read_as_clean(self):
+        host = self.host_clone()
+        self.write(host, "a.txt", "edited on the host\n")
+        self.fail_host_git_on("status")
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("is already on studio2", r.stdout)
+        self.assertEqual(self.read(host, "a.txt"), "edited on the host\n")
+        self.assert_untouched_here(S[4])
+
     def test_a_repo_git_cannot_read_is_refused_not_skipped(self):
         with open(os.path.join(self.repo, ".git", "config"), "a") as fh:
             fh.write("[broken\n")
@@ -979,6 +1000,30 @@ class Code(RemoteHarness):
         self.assertEqual(self.git(host, "stash", "list"), "")
         self.assert_untouched_here(S[4])
         self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
+
+    def test_a_failed_checkout_keeps_host_files_its_own_head_tracks(self):
+        host = self.host_clone()   # tracks b.txt
+        self.git(self.repo, "rm", "-q", "b.txt")
+        self.commit(self.repo, "drop b")
+        self.write(self.repo, "b.txt", "untracked here now\n")
+        self.fail_host_git_on("restore")
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("nothing changed", r.stderr)
+        self.assertEqual(self.read(host, "b.txt"), "b.txt 1\n")
+        self.assertEqual(self.git(host, "status", "--porcelain"), "")
+
+    def test_a_failed_checkout_into_an_empty_host_repo_leaves_it_empty(self):
+        host = self.host_path()
+        self.git(self.tmp, "init", "-q", host)
+        self.git(host, "remote", "add", "origin", self.origin)
+        self.fail_host_git_on("restore")
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("nothing changed", r.stderr)
+        self.assertEqual(os.listdir(host), [".git"])
+        self.assertEqual(self.git(host, "for-each-ref"), "")
+        self.assertEqual(self.git(host, "ls-files"), "")
 
     def test_a_failed_new_repo_on_the_host_is_removed(self):
         self.fail_host_git_on("restore")
