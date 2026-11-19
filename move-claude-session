@@ -1211,6 +1211,11 @@ def ssh_t_text(host: str, command: str) -> str:
     return f"ssh -t {host} {shlex.quote(login_shell(command))}"
 
 
+def in_cmux() -> bool:
+    """A remote resume opens a cmux ssh workspace; otherwise it needs this terminal."""
+    return bool(os.environ.get("CMUX_SURFACE_ID") and shutil.which("cmux"))
+
+
 def resume_remote(dest, session_id: str, title: str, cwd: str, dir_ok: bool) -> int:
     """Open the moved session on its host: a cmux ssh workspace inside cmux, else
     ssh -t in this terminal. A missing project dir there is said, not resumed."""
@@ -1222,7 +1227,7 @@ def resume_remote(dest, session_id: str, title: str, cwd: str, dir_ok: bool) -> 
         return 0
     print(f"\nresuming as {account} on {host} in {short_path(cwd)}\n  {command}\n", flush=True)
     try:
-        if os.environ.get("CMUX_SURFACE_ID") and shutil.which("cmux"):
+        if in_cmux():
             os.execvp("cmux", ["cmux", "ssh", host, "--name", title[:40] or session_id[:8],
                                "--command", command])
         os.execvp("ssh", ["ssh", "-t", "-o", "ConnectTimeout=10", "--", host,
@@ -1733,6 +1738,10 @@ def main(argv):
     if target not in accounts():
         account, _, host = target.partition("@")
         if host and host != LOCAL:
+            if resume and not dry and not in_cmux() and not (
+                    sys.stdin.isatty() and sys.stdout.isatty()):
+                die("--resume needs a terminal or cmux to open the session in; "
+                    "nothing was moved.")
             return move_to_host(session_id, account, check_host(host), dry, force, carry,
                                 resume)
         target = account

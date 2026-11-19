@@ -528,6 +528,15 @@ class Remote(RemoteHarness):
         self.assertIn("does not exist on studio2", r.stdout)
         self.assertFalse(os.path.exists(os.path.join(self.home, "cmux-launched")))
 
+    def test_cli_resume_without_cmux_or_a_terminal_is_refused_before_moving(self):
+        del self.env["CMUX_SURFACE_ID"]
+        r = self.run_cli(S[4], "sigint@studio2", "--resume")      # no tty: captured output
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--resume needs a terminal or cmux", r.stderr)
+        self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
+        self.assertEqual(self.transcript(".claude", S[4]), self.paths[S[4]])
+        self.assertFalse(os.path.exists(os.path.join(self.remotes, "studio2.resumed")))
+
     def test_cli_resume_is_refused_for_a_local_account(self):
         r = self.run_cli(S[4], "client", "--resume")
         self.assertNotEqual(r.returncode, 0)
