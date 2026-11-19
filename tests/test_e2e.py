@@ -8,6 +8,7 @@ import json
 import os
 import pty
 import select
+import shlex
 import shutil
 import struct
 import subprocess
@@ -26,15 +27,19 @@ S = {i + 1: s[0] for i, s in enumerate(fixture.SESSIONS)}   # S[1] .. S[6]
 
 ENTER, ESC, DOWN = b"\r", b"\x1b", b"\x1bOB"   # keypad mode sends ESC O B
 
-class E2E(unittest.TestCase):
+class Harness(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.home = os.path.realpath(os.path.join(self.tmp, "home"))
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        self.home = os.path.join(self.tmp, "home")
         os.makedirs(self.home)
         self.paths = fixture.build(self.home)
         bindir = os.path.join(self.tmp, "bin")
         fixture.write_fake_claude(bindir)
+        fixture.write_fake_remote_tools(bindir)   # never reach a real host or cmux
+        self.remotes = os.path.join(self.tmp, "remotes")
+        os.makedirs(self.remotes)
         self.env = fixture.env_for(self.home)
+        self.env["FAKE_REMOTES"] = self.remotes
         self.env["PATH"] = bindir + os.pathsep + self.env.get("PATH", "/usr/bin:/bin")
 
     def tearDown(self):
@@ -96,6 +101,8 @@ class E2E(unittest.TestCase):
                 for f in fs if f == f"{sid}.jsonl"]
         return hits[0] if hits else None
 
+
+class E2E(Harness):
     # ------------------------------------------------------------ ranking
 
     def test_list_groups_terminal_then_folder_then_all(self):
@@ -344,6 +351,241 @@ class E2E(unittest.TestCase):
         os.utime(self.paths[S[1]], None)   # written just now, no live process
         r = self.run_cli(S[1], "work")
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_no_hosts_means_no_machine_step(self):
+        os.makedirs(os.path.join(self.home, ".config", "move-claude-session"))
+        with open(os.path.join(self.home, ".config", "move-claude-session", "hosts"), "w") as fh:
+            fh.write("# nothing configured yet\n\n")
+        code, out = self.run_picker([("which session", ENTER),
+                                     ("which account", ENTER)])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("which machine", out)
+        self.assertIsNotNone(self.transcript(".claude-client", S[1]), out)
+        self.assertFalse(os.path.exists(os.path.join(self.remotes, "ssh.log")))
+
+
+class Remote(Harness):
+    """Moves to another machine, through the fake ssh in tests/fixture.py."""
+
+    def setUp(self):
+        super().setUp()
+        self.studio = fixture.build_remote(self.remotes, "studio2", [
+            (".claude", True), (".claude-sigint", True), (".claude-rush", False)])
+        self.hosts("studio1", "studio2")
+
+    def hosts(self, *names):
+        conf = os.path.join(self.home, ".config", "move-claude-session")
+        os.makedirs(conf, exist_ok=True)
+        with open(os.path.join(conf, "hosts"), "w") as fh:
+            fh.write("# ssh aliases\n" + "".join(f"{n}\n" for n in names))
+
+    def remote_transcript(self, account_dir, sid):
+        hits = [os.path.join(d, f) for d, _, fs in os.walk(os.path.join(self.studio, account_dir))
+                for f in fs if f == f"{sid}.jsonl"]
+        return hits[0] if hits else None
+
+    def ssh_log(self):
+        try:
+            with open(os.path.join(self.remotes, "ssh.log")) as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return ""
+
+    def cmux_launched(self):
+        with open(os.path.join(self.home, "cmux-launched")) as fh:
+            return fh.read().splitlines()
+
+    def resume_cmd(self, sid, account_dir, proj):
+        cwd = os.path.join(self.home, "code", proj)
+        root = os.path.join(self.studio, account_dir)
+        return (f"cd {shlex.quote(cwd)} && env CLAUDE_CONFIG_DIR={shlex.quote(root)} "
+                f"claude --resume {sid}")
+
+    def assert_untouched_here(self, sid):
+        self.assertEqual(self.transcript(".claude", sid), self.paths[sid])
+        self.assertTrue(os.path.isdir(os.path.join(self.home, ".claude", "file-history", sid)))
+        with open(self.paths[sid]) as fh:
+            self.assertNotIn(self.studio, fh.read())
+
+    # ------------------------------------------------------------ picker
+
+    def test_picker_moves_to_a_remote_account_and_resumes_in_cmux(self):
+        code, out = self.run_picker([("which session", ENTER),               # S1, default
+                                     ("which machine", DOWN + DOWN + ENTER),  # studio2
+                                     ("account on studio2", DOWN + DOWN + ENTER)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("no sessions yet", out)                 # rush has no projects/ yet
+        moved = self.remote_transcript(".claude-sigint", S[1])
+        self.assertIsNotNone(moved, out)
+        self.assertIsNone(self.transcript(".claude", S[1]))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".claude", "file-history", S[1])))
+        self.assertTrue(os.path.isdir(os.path.join(self.studio, ".claude-sigint", "file-history", S[1])))
+        with open(moved) as fh:
+            text = fh.read()
+        self.assertIn(os.path.join(self.studio, ".claude-sigint", "projects"), text)
+        self.assertNotIn(os.path.join(self.home, ".claude", "projects"), text)
+        self.assertEqual([e for e in os.listdir(os.path.join(self.studio, ".claude-sigint"))
+                          if e.startswith(".")], [])          # no staging dir left behind
+        launched = self.cmux_launched()
+        self.assertEqual(launched[:2], ["ssh", "studio2"])
+        self.assertEqual(launched[launched.index("--command") + 1],
+                         self.resume_cmd(S[1], ".claude-sigint", "billing-api"))
+        self.assertIn(self.resume_cmd(S[1], ".claude-sigint", "billing-api"), out)
+        log = self.ssh_log()
+        self.assertIn("BatchMode=yes", log)
+        self.assertIn("ConnectTimeout=", log)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "launched")))   # no local claude
+
+    def test_machine_and_account_steps_preselect_the_last_choice(self):
+        code, out = self.run_picker([("which session", ENTER),
+                                     ("which machine", DOWN + DOWN + ENTER),
+                                     ("account on studio2", DOWN + DOWN + ENTER)])
+        self.assertEqual(code, 0, out)
+        code, out = self.run_picker([("which session", b"monthly"),          # S6, default
+                                     ("1/", ENTER),
+                                     ("which machine", ENTER),
+                                     ("account on studio2", ENTER)])
+        self.assertEqual(code, 0, out)
+        self.assertIsNotNone(self.remote_transcript(".claude-sigint", S[6]), out)
+
+    def test_local_on_the_machine_step_is_todays_move(self):
+        code, out = self.run_picker([("which session", ENTER),
+                                     ("which machine", ENTER),               # local
+                                     ("account?", ENTER)])
+        self.assertEqual(code, 0, out)
+        self.assertIsNotNone(self.transcript(".claude-client", S[1]), out)
+        self.assertEqual(self.launched()["config"], os.path.join(self.home, ".claude-client"))
+        self.assertEqual(self.ssh_log(), "")
+
+    def test_hosts_can_come_from_the_environment(self):
+        os.remove(os.path.join(self.home, ".config", "move-claude-session", "hosts"))
+        self.env["MOVE_CLAUDE_SESSION_HOSTS"] = "studio2"
+        code, out = self.run_picker([("which session", ENTER),
+                                     ("which machine", DOWN + ENTER),
+                                     ("account on studio2", ENTER)])   # default
+        self.assertEqual(code, 0, out)
+        self.assertIsNotNone(self.remote_transcript(".claude", S[1]), out)
+
+    def test_outside_cmux_it_resumes_over_ssh_t(self):
+        del self.env["CMUX_SURFACE_ID"]
+        code, out = self.run_picker([("which session", ENTER),               # S1, newest
+                                     ("which machine", DOWN + DOWN + ENTER),
+                                     ("account on studio2", DOWN + DOWN + ENTER)])
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "cmux-launched")))
+        with open(os.path.join(self.remotes, "studio2.resumed")) as fh:
+            resumed = fh.read()
+        self.assertIn(self.resume_cmd(S[1], ".claude-sigint", "billing-api"), resumed)
+        self.assertIn('"$SHELL" -lic', resumed)
+
+    def test_missing_project_dir_on_the_remote_is_said_and_not_resumed(self):
+        shutil.rmtree(os.path.join(self.home, "code", "billing-api"))
+        code, out = self.run_picker([("which session", ENTER),
+                                     ("which machine", DOWN + DOWN + ENTER),
+                                     ("account on studio2", DOWN + DOWN + ENTER)])
+        self.assertEqual(code, 0, out)
+        self.assertIsNotNone(self.remote_transcript(".claude-sigint", S[1]), out)
+        self.assertIn("does not exist on studio2", out)
+        self.assertIn(self.resume_cmd(S[1], ".claude-sigint", "billing-api"), out)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "cmux-launched")))
+        self.assertFalse(os.path.exists(os.path.join(self.remotes, "studio2.resumed")))
+
+    # ------------------------------------------------------------ direct CLI
+
+    def test_cli_account_at_host_moves_and_prints_the_command(self):
+        r = self.run_cli(S[4], "sigint@studio2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("default → sigint@studio2 (3 items)", r.stdout)
+        self.assertIsNotNone(self.remote_transcript(".claude-sigint", S[4]))
+        self.assertIsNone(self.transcript(".claude", S[4]))
+        self.assertIn("ssh -t studio2 ", r.stdout)
+        self.assertIn(self.resume_cmd(S[4], ".claude-sigint", "dotfiles"), r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "cmux-launched")))
+        self.assertFalse(os.path.exists(os.path.join(self.remotes, "studio2.resumed")))
+
+    def test_cli_moves_to_the_same_account_name_on_the_remote(self):
+        r = self.run_cli(S[4], "default@studio2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.remote_transcript(".claude", S[4]))
+
+    def test_cli_moves_into_an_account_with_no_projects_yet(self):
+        r = self.run_cli(S[4], "rush@studio2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.remote_transcript(".claude-rush", S[4]))
+
+    def test_cli_unknown_remote_account_lists_what_it_found(self):
+        r = self.run_cli(S[4], "work@studio2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no account work on studio2 (one of default, rush, sigint)", r.stderr)
+        self.assert_untouched_here(S[4])
+
+    def test_unreachable_host_leaves_the_session_untouched(self):
+        r = self.run_cli(S[4], "sigint@studio9")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ssh: connect to host studio9", r.stderr)
+        self.assertNotIn("Alarm clock", r.stderr)
+        self.assert_untouched_here(S[4])
+
+    def test_a_dropped_upload_changes_nothing_and_a_rerun_works(self):
+        with open(os.path.join(self.remotes, "studio2.drop-on"), "w") as fh:
+            fh.write("tar -x")
+        r = self.run_cli(S[4], "sigint@studio2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("nothing changed", r.stderr)
+        self.assert_untouched_here(S[4])
+        self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
+        os.remove(os.path.join(self.remotes, "studio2.drop-on"))
+        r = self.run_cli(S[4], "sigint@studio2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.remote_transcript(".claude-sigint", S[4]))
+        self.assertIsNone(self.transcript(".claude", S[4]))
+
+    def test_a_corrupted_upload_is_refused_and_cleaned_up(self):
+        open(os.path.join(self.remotes, "studio2.corrupt"), "w").close()
+        r = self.run_cli(S[4], "sigint@studio2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("did not arrive intact", r.stderr)
+        self.assertIn("nothing changed", r.stderr)
+        self.assert_untouched_here(S[4])
+        self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
+
+    def test_an_unconfirmed_commit_keeps_the_local_copy(self):
+        with open(os.path.join(self.remotes, "studio2.drop-on"), "w") as fh:
+            fh.write("MCS-COMMITTED")
+        r = self.run_cli(S[4], "sigint@studio2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("could not confirm", r.stderr)
+        self.assert_untouched_here(S[4])
+
+    def test_remote_clash_stops_before_uploading(self):
+        clash = os.path.join(self.studio, ".claude-sigint", "file-history", S[4])
+        os.makedirs(clash)
+        r = self.run_cli(S[4], "sigint@studio2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("already exists", r.stderr)
+        self.assertNotIn("tar -x", self.ssh_log())
+        self.assert_untouched_here(S[4])
+        r = self.run_cli(S[4], "sigint@studio2", "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.remote_transcript(".claude-sigint", S[4]))
+
+    def test_running_session_is_refused_before_uploading(self):
+        r = self.run_cli(S[3], "sigint@studio2")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("still running", r.stderr)
+        self.assertNotIn("tar -x", self.ssh_log())
+
+    def test_dry_run_lists_what_would_go_where_and_writes_nothing(self):
+        r = self.run_cli(S[4], "sigint@studio2", "-n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("to sigint on studio2", r.stdout)
+        self.assertIn(os.path.join(self.studio, ".claude-sigint"), r.stdout)
+        self.assertIn("file-history", r.stdout)
+        self.assertIn("dry run", r.stdout)
+        self.assertNotIn("tar -x", self.ssh_log())
+        self.assert_untouched_here(S[4])
+        self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
+        self.assertEqual(sorted(os.listdir(os.path.join(self.studio, ".claude-sigint"))), ["projects"])
 
 
 if __name__ == "__main__":

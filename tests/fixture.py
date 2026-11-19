@@ -69,12 +69,82 @@ echo "(claude $* starts here)"
 """
 
 
-def write_fake_claude(bindir: str) -> None:
+# Stands in for `ssh`. A host is a directory under $FAKE_REMOTES, which becomes the
+# remote HOME; the command runs there under sh, the way sshd hands it to the login
+# shell. A host with no directory is unreachable. `$FAKE_REMOTES/<host>.drop-on`
+# holds a word: a command containing it gets the first 512 bytes of stdin, then the
+# connection drops. With `$FAKE_REMOTES/<host>.corrupt`, every uploaded transcript
+# gains a byte. `-t` (the resume) only records the command. Every call prints
+# ssh_config noise on stderr, as a ProxyCommand can on a call that succeeds.
+FAKE_SSH = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_REMOTES/ssh.log"
+echo "Alarm clock: 14  perl -e 'ualarm 300000' nc -z host 22" >&2
+tty=no
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    -t) tty=yes; shift ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+host=$1; shift
+home="$FAKE_REMOTES/$host"
+if [ ! -d "$home" ]; then
+  echo "ssh: connect to host $host port 22: Operation timed out" >&2
+  exit 255
+fi
+if [ $tty = yes ]; then
+  printf '%s\\n' "$*" > "$FAKE_REMOTES/$host.resumed"
+  exit 0
+fi
+cd "$home" || exit 255
+drop=$(cat "$FAKE_REMOTES/$host.drop-on" 2>/dev/null)
+if [ -n "$drop" ] && case "$*" in *"$drop"*) true ;; *) false ;; esac; then
+  head -c 512 | HOME="$home" sh -c "$*" >/dev/null 2>&1
+  echo "Connection to $host closed by remote host." >&2
+  exit 255
+fi
+HOME="$home" sh -c "$*"
+status=$?
+if [ -f "$FAKE_REMOTES/$host.corrupt" ]; then   # flip the upload's transcripts
+  find "$home" -path '*.partial/*.jsonl' -exec sh -c 'echo x >> "$1"' sh {} \\;
+fi
+exit $status
+"""
+
+# Stands in for `cmux`: records how it was called in ~/cmux-launched.
+FAKE_CMUX = """#!/bin/sh
+for a in "$@"; do printf '%s\\n' "$a"; done > "$HOME/cmux-launched"
+"""
+
+
+def write_tool(bindir: str, name: str, body: str) -> None:
     os.makedirs(bindir, exist_ok=True)
-    path = os.path.join(bindir, "claude")
+    path = os.path.join(bindir, name)
     with open(path, "w") as fh:
-        fh.write(FAKE_CLAUDE)
+        fh.write(body)
     os.chmod(path, 0o755)
+
+
+def write_fake_claude(bindir: str) -> None:
+    write_tool(bindir, "claude", FAKE_CLAUDE)
+
+
+def write_fake_remote_tools(bindir: str) -> None:
+    write_tool(bindir, "ssh", FAKE_SSH)
+    write_tool(bindir, "cmux", FAKE_CMUX)
+
+
+def build_remote(remotes: str, host: str, accounts) -> str:
+    """A fake remote host whose home holds these account dirs, each a
+    (dir name, has projects/) pair. Returns the remote home."""
+    home = os.path.join(remotes, host)
+    for name, has_projects in accounts:
+        os.makedirs(os.path.join(home, name, "projects" if has_projects else ""),
+                    exist_ok=True)
+    return home
 
 
 def build(home: str) -> dict:
@@ -131,7 +201,7 @@ def build(home: str) -> dict:
 def env_for(home: str) -> dict:
     """Environment that points the tool at the fake HOME and pane."""
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("CMUX_", "CLAUDE_", "XDG_"))}
+           if not k.startswith(("CMUX_", "CLAUDE_", "XDG_", "MOVE_CLAUDE_SESSION_"))}
     env.update(HOME=home, CMUX_SURFACE_ID=SURFACE,
                TERM="xterm-256color", LANG="en_US.UTF-8")
     return env
