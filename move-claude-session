@@ -818,13 +818,20 @@ def refuse_code(top: str, why: str) -> "NoReturn":
 
 def local_checkout(cwd: str, scratch: str):
     """The checkout cwd is in, or None when it isn't in one (or there is no git)."""
-    if not os.path.isdir(cwd) or not shutil.which("git"):
+    if not os.path.isdir(cwd):
+        return None
+    if not shutil.which("git"):
+        print("warning: no git on this machine, so the session's code is not carried",
+              file=sys.stderr)
         return None
     try:
         top, gitdir, common = git(["rev-parse", "--path-format=absolute", "--show-toplevel",
                                    "--git-dir", "--git-common-dir"], cwd).splitlines()
-    except (GitError, ValueError):
-        return None   # not in a work tree
+    except GitError as e:
+        if "not a git repository" in str(e) or "must be run in a work tree" in str(e):
+            return None
+        die(f"can't read the git checkout in {cwd}: {e}. Nothing changed. "
+            "Pass --no-code to move the session without it.")
     try:
         return Checkout(top, gitdir, common, scratch)
     except GitError as e:
@@ -980,6 +987,7 @@ undo_new() {
   else
     rm -rf "$top"
   fi
+  [ -z "$made" ] || rm -rf "$made"
   [ ! -e "$top" ] || stuck "$why, and could not remove $top"
   fail "$why"
 }
@@ -989,6 +997,11 @@ top)
   fetch "$top" || fail "could not fetch the code into $top: $(err)"
   p=$(dirty "$top")
   [ -z "$p" ] || [ "$force" = 1 ] || fail "$top has uncommitted changes ($p)"
+  # A file the snapshot adds that the host has as an ignored file would be
+  # overwritten, and no stash holds it. Refuse rather than lose it.
+  ign=$(cd "$top" && git diff --name-only -z --no-renames --diff-filter=A "$head" "$wip" |
+    xargs -0 sh -c 'for p; do { [ -e "$p" ] || [ -L "$p" ]; } && git check-ignore -q -- "$p" && { printf "%s\n" "$p"; break; }; done' sh)
+  [ -z "$ign" ] || fail "$top/$ign exists on the host as an ignored file, and the move would overwrite it"
   oref=$(git -C "$top" symbolic-ref -q HEAD) orig=$(git -C "$top" rev-parse -q --verify HEAD)
   if [ -n "$p" ]; then
     run git -C "$top" stash push -q -u -m "$stash" || fail "could not stash the changes in $top: $(err)"
@@ -999,6 +1012,8 @@ top)
   ;;
 worktree|clone)
   { [ ! -e "$top" ] && [ ! -L "$top" ]; } || fail "$top appeared on the host since the check"
+  made="" d=$(dirname "$top")
+  while [ ! -e "$d" ]; do made=$d d=$(dirname "$d"); done
   mkdir -p "$(dirname "$top")" || fail "could not create $(dirname "$top")"
   if [ "$mode" = worktree ]; then
     ident "$main"
