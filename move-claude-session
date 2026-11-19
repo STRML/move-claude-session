@@ -393,6 +393,10 @@ CLEANUP = r"""rm -rf "$1" && echo MCS-CLEAN"""
 COMMIT = r"""root=$1 stage=$2 force=$3 dir=$4 files=$5; shift 5
 trap '' HUP PIPE
 old="$stage.old"
+if [ -e "$old" ] || [ -L "$old" ]; then
+  printf 'MCS-STUCK an earlier failed move left the files it replaced in %s; put them back or delete them, then try again\n' "$old"
+  exit 1
+fi
 fail() { cd / && rm -rf "$stage" "$old"; printf 'MCS-FAIL %s\n' "$1"; exit 1; }
 cd "$stage" || fail "the uploaded copy is gone"
 if command -v shasum >/dev/null 2>&1; then sum="shasum -a 256"
@@ -410,7 +414,6 @@ for rel; do
   fi
 done
 there() { [ -e "$1" ] || [ -L "$1" ]; }
-rm -rf "$old"
 n=0
 for rel; do
   if mkdir -p "$(dirname "$root/$rel")" "$(dirname "$old/$rel")" &&
@@ -1192,10 +1195,11 @@ def main(argv):
     if len(args) != 2:
         die("usage: move-claude-session [<session_id> <account>[@<host>]]. Try --help.")
     session_id, target = args
-    account, _, host = target.partition("@")
-    if host and host != LOCAL and target not in accounts():
-        return move_to_host(session_id, account, check_host(host), dry, force)
-    target = account
+    if target not in accounts():
+        account, _, host = target.partition("@")
+        if host and host != LOCAL:
+            return move_to_host(session_id, account, check_host(host), dry, force)
+        target = account
     if target not in accounts():
         die(f"unknown account: {target} (one of {', '.join(accounts())})")
 

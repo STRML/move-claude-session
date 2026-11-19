@@ -605,6 +605,21 @@ class Remote(Harness):
         kept = [os.path.join(d, f) for d, _, fs in os.walk(sigint) for f in fs if f == "older"]
         self.assertEqual(len(kept), 1, kept)
         self.assertIn(".partial.old", kept[0])
+        r = self.run_cli(S[4], "sigint@studio2", "--force")   # a retry must not lose it
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("an earlier failed move left", r.stderr)
+        self.assertEqual(kept, [os.path.join(d, f) for d, _, fs in os.walk(sigint)
+                                for f in fs if f == "older"])
+        self.assert_untouched_here(S[4])
+
+    def test_a_local_account_with_at_in_its_name_stays_local(self):
+        os.makedirs(os.path.join(self.home, ".claude-sam@work", "projects"))
+        os.makedirs(os.path.join(self.home, ".claude-sam", "projects"))
+        r = self.run_cli(S[4], "sam@work")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.transcript(".claude-sam@work", S[4]))
+        self.assertIsNone(self.transcript(".claude-sam", S[4]))
+        self.assertEqual(self.ssh_log(), "")
 
     def test_a_bad_hosts_entry_is_skipped_not_fatal(self):
         self.hosts("studio2 (laptop)")
