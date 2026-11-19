@@ -219,6 +219,9 @@ When the session's project is a git checkout, the checkout moves with it, to the
 | The branch has commits this one lacks | Refused. Merge them first |
 | The repo has uncommitted changes | Refused, or stashed with `--force` |
 | The path holds something else, or another repo | Refused |
+| A file this side adds is an ignored file there | Refused, so it isn't overwritten |
+
+A repo with no commits yet is refused too: pass `--no-code` for it.
 
 Then the working tree is laid over the checkout: modified, deleted and untracked files, but not ignored ones. Staged and unstaged changes arrive as plain working-tree changes, with nothing staged. A detached HEAD stays detached. A repo nested inside the working tree (a clone, or a worktree under `.claude/worktrees`) is skipped and named. A repo with submodules or Git LFS files is refused: check those out on the other machine yourself and pass `--no-code`.
 
@@ -296,7 +299,7 @@ An ssh alias that points back at this machine (`localhost`, say) is refused when
 
 The repo here is only read. Its working tree is saved as a commit, built with a temporary index in a scratch object store that borrows the repo's objects, so nothing is written to the repo, its index or its refs. A `git bundle` of that commit, minus the commits the other machine's refs already hold, goes over ssh with its SHA-256. The other machine checks the hash, fetches the bundle, checks out HEAD, restores the saved working tree over it, and checks the result against the saved commit.
 
-The code goes before the session. If any step after the first change fails, the other machine is put back as it was, including the stash `--force` made, and nothing here changes. If the code lands and the session copy then fails, run the same move again: it finds the code already there and moves only the session.
+The code goes before the session. If any step after the first change fails, the other machine is put back as it was, including the stash `--force` made and any folders it created, and nothing here changes. If the code lands and the session copy then fails, run the same move again: it finds the code already there and moves only the session.
 
 </details>
 

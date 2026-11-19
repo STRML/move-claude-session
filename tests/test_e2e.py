@@ -919,6 +919,27 @@ class Code(RemoteHarness):
         self.assertFalse(self.applied())
         self.assert_untouched_here(S[4])
 
+    def test_an_ignored_file_on_the_host_is_not_overwritten(self):
+        host = self.host_clone()
+        with open(os.path.join(host, ".git", "info", "exclude"), "a") as fh:
+            fh.write("secret.txt\n")
+        self.write(host, "secret.txt", "only on the host\n")
+        self.write(self.repo, "secret.txt", "from here\n")
+        r = self.move("--force")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("secret.txt exists on the host as an ignored file", r.stderr)
+        self.assertEqual(self.read(host, "secret.txt"), "only on the host\n")
+        self.assert_untouched_here(S[4])
+
+    def test_a_repo_git_cannot_read_is_refused_not_skipped(self):
+        with open(os.path.join(self.repo, ".git", "config"), "a") as fh:
+            fh.write("[broken\n")
+        r = self.move()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("can't read the git checkout", r.stderr)
+        self.assertIn("--no-code", r.stderr)
+        self.assert_untouched_here(S[4])
+
     def test_submodules_and_lfs_are_refused_before_anything_is_sent(self):
         sha = self.head(self.repo)
         self.git(self.repo, "update-index", "--add", "--cacheinfo", f"160000,{sha},sub")
@@ -964,7 +985,7 @@ class Code(RemoteHarness):
         r = self.move()
         self.assertEqual(r.returncode, 1)
         self.assertIn("nothing changed", r.stderr)
-        self.assertFalse(os.path.exists(self.host_path()))
+        self.assertFalse(os.path.exists(os.path.join(self.studio, "code")))
         self.assert_untouched_here(S[4])
 
     def test_a_dropped_connection_while_carrying_the_code_keeps_the_session(self):
