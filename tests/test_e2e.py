@@ -549,6 +549,41 @@ class Remote(Harness):
         self.assert_untouched_here(S[4])
         self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
 
+    def test_a_host_that_is_this_machine_is_refused_even_with_force(self):
+        os.symlink(self.home, os.path.join(self.remotes, "loop"))   # like localhost
+        r = self.run_cli(S[4], "default@loop", "--force")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("loop is this machine", r.stderr)
+        self.assertEqual(self.transcript(".claude", S[4]), self.paths[S[4]])
+        self.assertTrue(os.path.isdir(os.path.join(self.home, ".claude", "file-history", S[4])))
+
+    def test_a_failed_forced_move_puts_back_what_it_replaced(self):
+        hist = os.path.join(self.studio, ".claude-sigint", "file-history")
+        os.makedirs(os.path.join(hist, S[4]))
+        with open(os.path.join(hist, S[4], "keep"), "w") as fh:
+            fh.write("older copy\n")
+        os.chmod(hist, 0o555)   # the last item can't be moved aside, so the move fails
+        try:
+            r = self.run_cli(S[4], "sigint@studio2", "--force")
+        finally:
+            os.chmod(hist, 0o755)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("could not move", r.stderr)
+        self.assert_untouched_here(S[4])
+        self.assertTrue(os.path.isfile(os.path.join(hist, S[4], "keep")))
+        self.assertIsNone(self.remote_transcript(".claude-sigint", S[4]))
+        self.assertEqual([e for e in os.listdir(os.path.join(self.studio, ".claude-sigint"))
+                          if e.startswith(".")], [])
+
+    def test_a_bad_hosts_entry_is_skipped_not_fatal(self):
+        self.hosts("studio2 (laptop)")
+        code, out = self.run_picker([("which session", ENTER),
+                                     ("which machine", DOWN + ENTER),
+                                     ("account on studio2", ENTER)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("skipped '(laptop)'", out)
+        self.assertIsNotNone(self.remote_transcript(".claude", S[1]), out)
+
     def test_an_unconfirmed_commit_keeps_the_local_copy(self):
         with open(os.path.join(self.remotes, "studio2.drop-on"), "w") as fh:
             fh.write("MCS-COMMITTED")

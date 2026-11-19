@@ -254,7 +254,9 @@ here                                   studio2
 5  delete the originals here  ◀─────── only after step 4 reports done
 ```
 
-Transcripts are rewritten before they're sent, so paths inside them point at the new account on the other machine. If a step fails, the staging folder is removed and nothing here changes. If the connection drops during step 4, the tool can't tell whether the move landed, so it deletes nothing here and says so. Run the same move again: if the first one landed, it stops with "destination already exists".
+Transcripts are rewritten before they're sent, so paths inside them point at the new account on the other machine. If a step fails, the staging folder is removed and nothing here changes. With `--force`, files it replaces on the other machine are set aside until the rest are in place, and put back if any move fails. Step 4 keeps running if the connection drops, so it either finishes or rolls back, but the tool can't tell which: it deletes nothing here and says so. Run the same move again. If the first one landed, it stops with "destination already exists".
+
+An ssh alias that points back at this machine (`localhost`, say) is refused when the target is the session's own account, since the copy and the original would be the same files.
 
 </details>
 

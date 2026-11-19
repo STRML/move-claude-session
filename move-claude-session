@@ -372,6 +372,7 @@ for d in .claude .claude-*; do
 done"""
 
 PREFLIGHT = r"""root=$1 dir=$2; shift 2
+printf 'MCS-ROOT %s %s\n' "$(ls -di "$root" | awk '{print $1}')" "$(cd "$root" && pwd -P)"
 for rel; do
   if [ -e "$root/$rel" ] || [ -L "$root/$rel" ]; then printf 'MCS-EXISTS %s\n' "$rel"; fi
 done
@@ -385,8 +386,13 @@ CLEANUP = r"""rm -rf "$1" && echo MCS-CLEAN"""
 # stdin: "<sha256>  <path>" for every file. Each hash is taken from stdin, so the
 # output shape of GNU sha256sum, BSD sha256sum and shasum is the same. The count
 # is checked too: a list cut short would otherwise pass on the lines that arrived.
+# It ignores HUP and PIPE, so a dropped connection can't stop it halfway: it either
+# finishes or rolls back. Items it replaces (--force) wait in $stage.old until the
+# rest are in place, and go back if any move fails.
 COMMIT = r"""root=$1 stage=$2 force=$3 dir=$4 files=$5; shift 5
-fail() { cd / && rm -rf "$stage"; printf 'MCS-FAIL %s\n' "$1"; exit 1; }
+trap '' HUP PIPE
+old="$stage.old"
+fail() { cd / && rm -rf "$stage" "$old"; printf 'MCS-FAIL %s\n' "$1"; exit 1; }
 cd "$stage" || fail "the uploaded copy is gone"
 if command -v shasum >/dev/null 2>&1; then sum="shasum -a 256"; else sum=sha256sum; fi
 n=0
@@ -400,14 +406,24 @@ for rel; do
     fail "$root/$rel already exists"
   fi
 done
+there() { [ -e "$1" ] || [ -L "$1" ]; }
+rm -rf "$old"
 n=0
 for rel; do
-  if mkdir -p "$(dirname "$root/$rel")" && rm -rf "$root/$rel" && mv "$stage/$rel" "$root/$rel"
+  if mkdir -p "$(dirname "$root/$rel")" "$(dirname "$old/$rel")" &&
+     { ! there "$root/$rel" || mv "$root/$rel" "$old/$rel"; } &&
+     mv "$stage/$rel" "$root/$rel"
   then n=$((n + 1)); continue; fi
-  for back; do [ "$n" -gt 0 ] || break; rm -rf "$root/$back"; n=$((n - 1)); done
+  i=0
+  for back; do
+    [ "$i" -le "$n" ] || break
+    [ "$i" -lt "$n" ] && rm -rf "$root/$back"
+    there "$old/$back" && mv "$old/$back" "$root/$back"
+    i=$((i + 1))
+  done
   fail "could not move $rel into place"
 done
-cd / && rm -rf "$stage"
+cd / && rm -rf "$stage" "$old"
 if [ -d "$dir" ]; then echo MCS-DIR yes; else echo MCS-DIR no; fi
 echo MCS-COMMITTED"""
 
@@ -430,8 +446,11 @@ def configured_hosts():
             return []
     hosts = []
     for host in words.replace(",", " ").split():
-        if host != LOCAL and host not in hosts:
-            hosts.append(check_host(host))
+        if not HOST_RE.match(host):
+            print(f"warning: skipped {host!r} in the hosts list, not an ssh host alias",
+                  file=sys.stderr)
+        elif host != LOCAL and host not in hosts:
+            hosts.append(host)
     return hosts
 
 
@@ -552,6 +571,8 @@ def move_remote(session_id, source, src_jsonl, proj, dest, dry, force):
     code, lines, err = ssh_run(host, PREFLIGHT, [root, cwd, *rels])
     if code != 0 or "MCS-OK" not in lines:
         die(f"can't check {host}: {err}. Nothing changed.")
+    if remote_is_here(lines, src_root):
+        die(f"{host} is this machine: {root} is the account the session is in. Nothing changed.")
     clashes = [ln[len("MCS-EXISTS "):] for ln in lines if ln.startswith("MCS-EXISTS ")]
     dir_ok = "MCS-DIR yes" in lines
 
@@ -568,6 +589,7 @@ def move_remote(session_id, source, src_jsonl, proj, dest, dry, force):
         die(f"destination already exists on {host}: {root}/{clashes[0]} (use --force to overwrite)")
 
     title = read_label(src_jsonl)[1] or session_id
+    before = {src: os.lstat(src).st_ino for src, _ in moves}
     stage = f"{root}/.move-claude-session-{session_id}.partial"
     sums = []
     try:
@@ -589,12 +611,34 @@ def move_remote(session_id, source, src_jsonl, proj, dest, dry, force):
         if failed:
             die(f"move to {host} failed, nothing changed: {failed}")
         die(f"could not confirm the move on {host} ({err}). Nothing was deleted here. "
-            f"Run the same move again: if the first one landed, it stops with "
-            f"'destination already exists', and the copy on {host} is complete.")
+            f"On {host} the move either finished or rolled itself back: run the same "
+            f"move again. If it stops with 'destination already exists', the session "
+            f"is in {root} on {host} and this copy can go.")
+    # A source that changed under us means the host was this machine after all.
+    replaced = [src for src, _ in moves if not same_inode(src, before[src])]
+    if replaced:
+        die(f"the move wrote over the originals here, so {host} looks like this machine. "
+            f"Nothing was deleted:\n  " + "\n  ".join(replaced))
     delete_sources(moves)
     save_last(account, host)
     print(f"moved {title}: {source} → {account}@{host} ({len(moves)} items)")
     return cwd, "MCS-DIR yes" in lines
+
+
+def remote_is_here(preflight_lines, src_root: str) -> bool:
+    """Whether the remote account dir is this machine's source account dir (same
+    real path and inode), as when an ssh alias points back at this machine."""
+    line = next((ln for ln in preflight_lines if ln.startswith("MCS-ROOT ")), "")
+    ino, _, path = line[len("MCS-ROOT "):].partition(" ")
+    st = os.stat(src_root)
+    return path == os.path.realpath(src_root) and ino == str(st.st_ino)
+
+
+def same_inode(path: str, ino: int) -> bool:
+    try:
+        return os.lstat(path).st_ino == ino
+    except OSError:
+        return False
 
 
 def remote_resume(dest, session_id: str, cwd: str) -> str:
