@@ -44,6 +44,8 @@ move-claude-session
 1. Pick the session. The one you just quit is on top and already selected.
 2. Pick the account to move it to. The one you moved to last time is preselected, and with only one other account this step is skipped.
 
+If you list other machines (see [Other machines](#other-machines)), a machine step comes between the two.
+
 It moves the session, `cd`s into the session's project directory, and resumes it under the new account.
 
 <p align="center"><img alt="The session picker" src="demo/pick-session.png" width="860"><br><sub>1 · pick the session</sub></p>
@@ -79,7 +81,11 @@ The title on each row is the one Claude Code puts on the terminal tab: your `/re
 move-claude-session <session-id> <account>
 ```
 
-This moves the session and prints the command to resume it. Add `-n` to see every file that would move.
+This moves the session and prints the command to resume it. Add `-n` to see every file that would move. To move it to another machine, name the account there and the ssh host:
+
+```sh
+move-claude-session <session-id> sigint@studio2
+```
 
 | Option | Effect |
 |---|---|
@@ -160,6 +166,58 @@ Ask me for the account name, then use it as NAME below.
 
 </details>
 
+## Other machines
+
+To move sessions to another machine, list its ssh alias in `~/.config/move-claude-session/hosts`, one per line (`$XDG_CONFIG_HOME` is respected):
+
+```
+studio1
+studio2
+```
+
+`MOVE_CLAUDE_SESSION_HOSTS="studio1 studio2"` replaces the file. With no hosts listed there is no machine step, and the tool works exactly as before.
+
+The picker then asks for the machine after the session. The machine you used last time is preselected:
+
+```
+Move to which machine?
+❯   3/3
+
+  local     this machine
+  studio1   over ssh
+  studio2   over ssh
+```
+
+The account step lists the `~/.claude` and `~/.claude-<name>` config dirs on that machine, read over ssh. An account you've logged in to but never run a session in has no `projects/` yet. It's still listed, and picking it creates `projects/`:
+
+```
+Move to which account on studio2?  (now in sigint on this machine)
+❯   3/3
+
+  default   ~/.claude
+  rush      ~/.claude-rush  no sessions yet
+  sigint    ~/.claude-sigint
+```
+
+The other machine needs:
+
+- an ssh login that works without a prompt (the tool runs ssh with `BatchMode=yes`, so a password or passphrase prompt fails instead of hanging);
+- `sh`, `tar`, and `shasum` or `sha256sum`, which every Mac and most Linux machines have;
+- the session's project at the same absolute path.
+
+The tool moves the session, not the code. Check the repo out on the other machine first. If the session's directory isn't there, the tool says so and prints the resume command instead of resuming in the wrong place.
+
+After the move, it resumes the session on the other machine:
+
+| Where you run it | What opens |
+|---|---|
+| In [cmux](https://cmux.dev) | a `cmux ssh` workspace running `cd <dir> && claude --resume <id>` |
+| Anywhere else | the same command in this terminal, through `ssh -t` and a login shell |
+
+The command sets `CLAUDE_CONFIG_DIR` to the account's config dir, the same thing the launcher in [Add an account](#add-an-account) does, or clears it for `default`.
+
+`cmux session move` (cmux 0.65 and later) also moves a session to another machine, and carries the git checkout with it. It has no option to pick the account, so it can't move a session from one account to another the way this tool does.
+
 ## How it works
 
 <details>
@@ -179,6 +237,26 @@ projects/<project>/cship/<session-id>-*   cship caches
 The session keeps its project folder name in the new account, so `claude --resume` finds it from the same working directory. Every old path inside the moved transcripts is rewritten to its new location, so saved tool output still resolves.
 
 The move copies everything first, rewrites the copies, and deletes the originals only after that succeeds. If a copy fails, the copies are removed and the session is left untouched where it was.
+
+</details>
+
+<details>
+<summary><b>How a move to another machine stays safe</b></summary>
+
+<br>
+
+```
+here                                   studio2
+1  list accounts              ──ssh─▶  ~/.claude, ~/.claude-*
+2  check the destination      ──ssh─▶  anything already there? project dir there?
+3  send a tar of the session  ──ssh─▶  ~/.claude-sigint/.move-claude-session-<id>.partial/
+4  send each file's SHA-256   ──ssh─▶  check each file, then move them into place
+5  delete the originals here  ◀─────── only after step 4 reports done
+```
+
+Transcripts are rewritten before they're sent, so paths inside them point at the new account on the other machine. If a step fails, the staging folder is removed and nothing here changes. With `--force`, files it replaces on the other machine are set aside until the rest are in place, and put back if any move fails. Step 4 keeps running if the connection drops, so it either finishes or rolls back, but the tool can't tell which: it deletes nothing here and says so. Run the same move again. If the first one landed, it stops with "destination already exists".
+
+An ssh alias that points back at this machine (`localhost`, say) is refused when the target is the session's own account, since the copy and the original would be the same files.
 
 </details>
 

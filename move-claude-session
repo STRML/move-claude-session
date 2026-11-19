@@ -14,6 +14,7 @@ CLAUDE_CONFIG_DIR finds it.
 Usage:
     move-claude-session                     pick a session, pick an account, move, resume
     move-claude-session <session_id> <account>
+    move-claude-session <session_id> <account>@<host>
 
 With no arguments it opens a picker with three sections, newest first in each:
 
@@ -24,8 +25,15 @@ With no arguments it opens a picker with three sections, newest first in each:
 The account step preselects the account you moved to last, and is skipped when only
 one other account exists.
 
+Other machines: list ssh aliases, one per line, in
+~/.config/move-claude-session/hosts (or set MOVE_CLAUDE_SESSION_HOSTS="a b"). The
+picker then asks which machine before the account, starting on the last one used,
+and lists that machine's accounts over ssh. With no hosts there is no machine step.
+
 Type to filter, arrows to move, Enter to pick, Esc to cancel. After the move it runs
 `claude --resume <id>` under the new account, from the session's project directory.
+On another machine it does that in a `cmux ssh` workspace, or with `ssh -t` outside
+cmux, and only when the project directory exists there.
 
 Options:
     -n, --dry-run   Show what would happen; change nothing.
@@ -46,9 +54,12 @@ What it moves (paths relative to the account's config dir):
 
 The transcript and subagent transcripts have each moved path rewritten to its new
 location, so persisted tool output still resolves. Nothing else is rewritten.
+The project's code does not move: check it out on the other machine yourself.
 """
 
 import functools
+import hashlib
+import io
 import json
 import mmap
 import os
@@ -57,10 +68,13 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 DEFAULT_ACCOUNT = "default"
+LOCAL = "local"   # the machine step's name for this machine
 CMUX_HOOK_SESSIONS = "~/.cmuxterm/claude-hook-sessions.json"
 # Picker sections: (title, how many of the newest sessions it shows).
 GROUPS = (("in this terminal", 10), ("in this folder", 20), ("all sessions", 40))
@@ -199,15 +213,19 @@ def plan_moves(session_id: str, src_root: str, dst_root: str, proj: str):
     return [(os.path.join(src_root, r), os.path.join(dst_root, r)) for r in rel]
 
 
-def rewrite_paths(path: str, moves) -> None:
-    """Point moved paths inside a transcript at their new location. Works on bytes,
-    so a transcript with invalid UTF-8 keeps every byte."""
-    with open(path, "rb") as fh:
-        data = fh.read()
+def rewritten(data: bytes, moves) -> bytes:
+    """Transcript bytes with every moved path pointed at its new location. Works on
+    bytes, so a transcript with invalid UTF-8 keeps every byte."""
     for src, dst in moves:
         data = data.replace(os.fsencode(src), os.fsencode(dst))
+    return data
+
+
+def rewrite_paths(path: str, moves) -> None:
+    with open(path, "rb") as fh:
+        data = fh.read()
     with open(path, "wb") as fh:
-        fh.write(data)
+        fh.write(rewritten(data, moves))
 
 
 def resume_dir(jsonl_path: str, proj: str) -> str:
@@ -277,6 +295,11 @@ def transfer(moves, force: bool) -> None:
         if not isinstance(e, Exception):
             raise
         die(f"move failed, nothing changed: {e}")
+    delete_sources(moves)
+
+
+def delete_sources(moves) -> None:
+    """Delete the originals once their copies are in place."""
     leftovers = []
     for src, _ in moves:
         try:
@@ -289,9 +312,10 @@ def transfer(moves, force: bool) -> None:
               file=sys.stderr)
 
 
-def move_session(session_id: str, target: str, dry: bool, force: bool):
-    """Move the session to `target`. Returns the directory to resume from, or None
-    on a dry run."""
+def move_session(session_id: str, target: str, dry: bool, force: bool, dest=None):
+    """Move the session to `target`, or to the remote account `dest` when given.
+    Returns the directory to resume from (with, for a remote, whether it exists
+    there), or None on a dry run."""
     hits = find_transcripts(session_id)
     if not hits:
         die(f"no transcript for session {session_id} in any account")
@@ -299,7 +323,7 @@ def move_session(session_id: str, target: str, dry: bool, force: bool):
         die("session found in more than one place:\n  "
             + "\n  ".join(f"{n}: {p}" for n, p in hits))
     source, src_jsonl = hits[0]
-    if source == target:
+    if dest is None and source == target:
         die(f"session already lives in {target}: {src_jsonl}")
 
     pid = running_sessions(force).get(session_id)
@@ -307,6 +331,8 @@ def move_session(session_id: str, target: str, dry: bool, force: bool):
         die(f"session is still running (pid {pid}). Quit it first, or pass --force.")
 
     proj = os.path.basename(os.path.dirname(src_jsonl))
+    if dest is not None:
+        return move_remote(session_id, source, src_jsonl, proj, dest, dry, force)
     moves = plan_moves(session_id, account_root(source), account_root(target), proj)
 
     if dry:
@@ -319,9 +345,361 @@ def move_session(session_id: str, target: str, dry: bool, force: bool):
 
     title = read_label(src_jsonl)[1] or session_id
     transfer(moves, force)
-    save_last_target(target)
+    save_last(target, LOCAL)
     print(f"moved {title}: {source} → {target} ({len(moves)} items)")
     return resume_dir(moves[0][1], proj)
+
+
+# ---------------------------------------------------------------- other machines
+#
+# A remote move runs four ssh calls, each a POSIX sh script that reports on
+# stdout through MCS- lines (ssh_config can print noise on stderr even when a
+# call succeeds): find the accounts, check the destination, upload into a staging
+# dir beside them, then verify and move into place. Local files are deleted only
+# after the last call reports MCS-COMMITTED.
+
+SSH_OPTS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4")
+HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]*\Z")
+ACCOUNT_RE = re.compile(r"[A-Za-z0-9._-]+\Z")
+
+DISCOVER = r"""cd || exit 1
+printf 'MCS-HOME %s\n' "$PWD"
+for d in .claude .claude-*; do
+  [ -d "$d" ] || continue
+  [ -d "$d/projects" ] || [ -e "$d/.claude.json" ] || [ -e "$d/settings.json" ] || continue
+  if [ -d "$d/projects" ]; then p=1; else p=0; fi
+  printf 'MCS-ACCOUNT %s %s\n' "$p" "$d"
+done"""
+
+PREFLIGHT = r"""root=$1 dir=$2; shift 2
+printf 'MCS-ROOT %s %s\n' "$(ls -di "$root" | awk '{print $1}')" "$(cd "$root" && pwd -P)"
+for rel; do
+  if [ -e "$root/$rel" ] || [ -L "$root/$rel" ]; then printf 'MCS-EXISTS %s\n' "$rel"; fi
+done
+if [ -d "$dir" ]; then echo MCS-DIR yes; else echo MCS-DIR no; fi
+echo MCS-OK"""
+
+UPLOAD = r"""rm -rf "$1" && mkdir -p "$1" && cd "$1" && tar -xpf - && echo MCS-UPLOADED"""
+
+CLEANUP = r"""rm -rf "$1" && echo MCS-CLEAN"""
+
+# stdin: "<sha256>  <path>" for every file. Each hash is taken from stdin, so the
+# output shape of GNU sha256sum, BSD sha256sum and shasum is the same. The count
+# is checked too: a list cut short would otherwise pass on the lines that arrived.
+# It ignores HUP and PIPE, so a dropped connection can't stop it halfway: it either
+# finishes or rolls back. Items it replaces (--force) wait in $stage.old until the
+# rest are in place, and go back if any move fails.
+COMMIT = r"""root=$1 stage=$2 force=$3 dir=$4 files=$5; shift 5
+trap '' HUP PIPE
+old="$stage.old"
+if [ -e "$old" ] || [ -L "$old" ]; then
+  rm -rf "$stage"
+  printf 'MCS-STUCK an earlier failed move left the files it replaced in %s; put them back or delete them, then try again\n' "$old"
+  exit 1
+fi
+fail() { cd / && rm -rf "$stage" "$old"; printf 'MCS-FAIL %s\n' "$1"; exit 1; }
+cd "$stage" || fail "the uploaded copy is gone"
+if command -v shasum >/dev/null 2>&1; then sum="shasum -a 256"
+elif command -v sha256sum >/dev/null 2>&1; then sum=sha256sum
+else fail "no shasum or sha256sum to check the copy with"; fi
+n=0
+while read -r want rel; do
+  got=$($sum < "$rel" | cut -c1-64) && [ "$got" = "$want" ] || fail "$rel did not arrive intact"
+  n=$((n + 1))
+done
+[ "$n" = "$files" ] || fail "the file list did not arrive whole"
+for rel; do
+  if [ "$force" != 1 ] && { [ -e "$root/$rel" ] || [ -L "$root/$rel" ]; }; then
+    fail "$root/$rel already exists"
+  fi
+done
+there() { [ -e "$1" ] || [ -L "$1" ]; }
+n=0
+for rel; do
+  if mkdir -p "$(dirname "$root/$rel")" "$(dirname "$old/$rel")" &&
+     { ! there "$root/$rel" || mv "$root/$rel" "$old/$rel"; } &&
+     mv "$stage/$rel" "$root/$rel"
+  then n=$((n + 1)); continue; fi
+  i=0 stuck=""
+  for back; do
+    [ "$i" -le "$n" ] || break
+    if [ "$i" -lt "$n" ]; then rm -rf "$root/$back" || stuck=1; fi
+    if there "$old/$back"; then
+      if there "$root/$back"; then stuck=1; else mv "$old/$back" "$root/$back" || stuck=1; fi
+    fi
+    i=$((i + 1))
+  done
+  if [ -n "$stuck" ]; then
+    printf 'MCS-STUCK could not move %s into place, and could not undo it all: what it replaced is kept in %s\n' "$rel" "$old"
+    exit 1
+  fi
+  fail "could not move $rel into place"
+done
+cd / && rm -rf "$stage" "$old"
+if [ -d "$dir" ]; then echo MCS-DIR yes; else echo MCS-DIR no; fi
+echo MCS-COMMITTED"""
+
+
+def check_host(host: str) -> str:
+    if not HOST_RE.match(host):
+        die(f"not an ssh host alias: {host!r}")
+    return host
+
+
+def configured_hosts():
+    """ssh destinations to offer on the machine step: $MOVE_CLAUDE_SESSION_HOSTS
+    when set (space or comma separated), else one per line in the hosts file."""
+    words = os.environ.get("MOVE_CLAUDE_SESSION_HOSTS")
+    if words is None:
+        try:
+            with open(hosts_path(), encoding="utf-8") as fh:
+                words = "\n".join(line.split("#", 1)[0] for line in fh)
+        except OSError:
+            return []
+    hosts = []
+    for host in words.replace(",", " ").split():
+        if not HOST_RE.match(host):
+            print(f"warning: skipped {host!r} in the hosts list, not an ssh host alias",
+                  file=sys.stderr)
+        elif host != LOCAL and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def hosts_path() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "move-claude-session", "hosts")
+
+
+def ssh_error(stderr: str) -> str:
+    """The line that says why ssh failed, skipping ssh_config noise."""
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    known = [ln for ln in lines if ln.startswith("ssh:") or re.search(
+        r"Connection|Permission denied|[Hh]ost key|timed out", ln)]
+    return (known or lines or ["no error output"])[-1]
+
+
+def ssh_run(host: str, script: str, args=(), feed=None, timeout=60):
+    """Run a sh script on host with these arguments; `feed(stdin)` writes its input.
+    Returns (exit code, stdout lines, the error line from stderr)."""
+    for a in args:
+        if "\\" in a or "\n" in a:   # fish reads backslashes in single quotes
+            die(f"can't pass this path over ssh: {a!r}")
+    remote = " ".join(["sh", "-c", shlex.quote(script), "sh", *map(shlex.quote, args)])
+    argv = ["ssh", *SSH_OPTS, "--", host, remote]
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE if feed else subprocess.DEVNULL,
+                                    stdout=out, stderr=err)
+        except OSError as e:
+            return 255, [], f"ssh: {e}"
+        try:
+            if feed:
+                feed(proc.stdin)
+                proc.stdin.close()
+        except BrokenPipeError:
+            pass   # the far end went away; its exit code says how
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return 255, [], f"ssh: no answer from {host} in {timeout} s"
+        out.seek(0)
+        err.seek(0)
+        return (code, out.read().decode(errors="replace").splitlines(),
+                ssh_error(err.read().decode(errors="replace")))
+
+
+@functools.lru_cache(maxsize=None)
+def remote_accounts(host: str):
+    """(home, {name: (config dir, has projects/)}) on host. A config dir without
+    projects/ is an account that has not run a session yet."""
+    code, lines, err = ssh_run(host, DISCOVER)
+    home = next((ln[len("MCS-HOME "):] for ln in lines if ln.startswith("MCS-HOME ")), None)
+    if code != 0 or home is None:
+        die(f"can't reach {host}: {err}. Nothing changed.")
+    found = {}
+    for ln in lines:
+        if not ln.startswith("MCS-ACCOUNT "):
+            continue
+        flag, d = ln[len("MCS-ACCOUNT "):].split(" ", 1)
+        name = DEFAULT_ACCOUNT if d == ".claude" else d[len(".claude-"):]
+        if ACCOUNT_RE.match(name) and name not in found:   # ~/.claude wins "default"
+            found[name] = (f"{home}/{d}", flag == "1")
+    if not found:
+        die(f"no Claude Code config dir on {host} (looked for ~/.claude and ~/.claude-*)")
+    return home, found
+
+
+def remote_dest(host: str, account: str):
+    """(host, account, config dir) for an account on host, or die naming the ones
+    it has."""
+    found = remote_accounts(host)[1]
+    if account not in found:
+        die(f"no account {account} on {host} (one of {', '.join(found)})")
+    return host, account, found[account][0]
+
+
+def pack(moves, src_root: str, fh, sums) -> None:
+    """Write the session to fh as a tar stream, paths relative to the config dir,
+    transcripts rewritten, adding a sha256 line to sums for every regular file."""
+    with tarfile.open(fileobj=fh, mode="w|", format=tarfile.PAX_FORMAT) as tar:
+        for src, _ in moves:
+            for path in [src] + sorted(walk_tree(src)):
+                arc = os.path.relpath(path, src_root)
+                info = tar.gettarinfo(path, arc)
+                if info is None:   # a socket or other special file
+                    continue
+                if not info.isfile():
+                    tar.addfile(info)
+                    continue
+                with open(path, "rb") as f:
+                    data = f.read()
+                if path.endswith(".jsonl"):
+                    data = rewritten(data, moves)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+                sums.append(f"{hashlib.sha256(data).hexdigest()}  {arc}\n")
+
+
+def walk_tree(path: str):
+    """Everything under a directory, symlinks included but not followed."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        return []
+    def unreadable(e):
+        raise e
+    return [os.path.join(d, n) for d, dirs, files in os.walk(path, onerror=unreadable)
+            for n in dirs + files]
+
+
+def move_remote(session_id, source, src_jsonl, proj, dest, dry, force):
+    host, account, root = dest
+    src_root = account_root(source)
+    moves = plan_moves(session_id, src_root, root, proj)
+    rels = [os.path.relpath(src, src_root) for src, _ in moves]
+    cwd = resume_dir(src_jsonl, proj)
+    code, lines, err = ssh_run(host, PREFLIGHT, [root, cwd, *rels])
+    if code != 0 or "MCS-OK" not in lines:
+        die(f"can't check {host}: {err}. Nothing changed.")
+    if remote_is_here(lines, src_root):
+        die(f"{host} is this machine: {root} is the account the session is in. Nothing changed.")
+    clashes = [ln[len("MCS-EXISTS "):] for ln in lines if ln.startswith("MCS-EXISTS ")]
+    dir_ok = "MCS-DIR yes" in lines
+
+    if dry:
+        print(f"would move {session_id} from {source} ({src_root})"
+              f" to {account} on {host} ({root}):")
+        for rel in rels:
+            print(f"  {rel}{'   (already there)' if rel in clashes else ''}")
+        if not dir_ok:
+            print(f"\n{cwd} does not exist on {host}.")
+        print("\n(dry run, nothing changed)")
+        return None
+    if clashes and not force:
+        die(f"destination already exists on {host}: {root}/{clashes[0]} (use --force to overwrite)")
+
+    title = read_label(src_jsonl)[1] or session_id
+    before = {src: os.lstat(src).st_ino for src, _ in moves}
+    stage = f"{root}/.move-claude-session-{session_id}.partial"
+    sums = []
+    try:
+        code, lines, err = ssh_run(host, UPLOAD, [stage], timeout=None,
+                                   feed=lambda fh: pack(moves, src_root, fh, sums))
+        listing = os.fsencode("".join(sums))
+    except (Exception, KeyboardInterrupt) as e:   # a local file that can't be read, Ctrl-C
+        code, lines, err = 1, [], str(e) or type(e).__name__
+    if code != 0 or "MCS-UPLOADED" not in lines:
+        if "MCS-CLEAN" in ssh_run(host, CLEANUP, [stage])[1]:
+            die(f"copy to {host} failed, nothing changed: {err}")
+        die(f"copy to {host} failed: {err}. The session is untouched here. A partial "
+            f"copy may be left in {host}:{stage}; the next try replaces it.")
+    try:
+        code, lines, err = ssh_run(host, COMMIT, [root, stage, "1" if force else "0", cwd,
+                                                  str(len(sums)), *rels],
+                                   feed=lambda fh: fh.write(listing), timeout=600)
+    except KeyboardInterrupt:
+        lines, err = [], "interrupted"
+    if "MCS-COMMITTED" not in lines:
+        failed = next((ln[len("MCS-FAIL "):] for ln in lines if ln.startswith("MCS-FAIL ")), None)
+        if failed:
+            die(f"move to {host} failed, nothing changed: {failed}")
+        stuck = next((ln[len("MCS-STUCK "):] for ln in lines if ln.startswith("MCS-STUCK ")), None)
+        if stuck:
+            die(f"move to {host} failed: {stuck}. Nothing was deleted here.")
+        die(f"could not confirm the move on {host} ({err}). Nothing was deleted here. "
+            f"On {host} the move either finished or rolled itself back: run the same "
+            f"move again. If it stops with 'destination already exists', the session "
+            f"is in {root} on {host} and this copy can go.")
+    # A source that changed under us means the host was this machine after all.
+    replaced = [src for src, _ in moves if not same_inode(src, before[src])]
+    if replaced:
+        die(f"the move wrote over the originals here, so {host} looks like this machine. "
+            f"Nothing was deleted:\n  " + "\n  ".join(replaced))
+    delete_sources(moves)
+    save_last(account, host)
+    print(f"moved {title}: {source} → {account}@{host} ({len(moves)} items)")
+    return cwd, "MCS-DIR yes" in lines
+
+
+def remote_is_here(preflight_lines, src_root: str) -> bool:
+    """Whether the remote account dir is this machine's source account dir (same
+    real path and inode), as when an ssh alias points back at this machine."""
+    line = next((ln for ln in preflight_lines if ln.startswith("MCS-ROOT ")), "")
+    ino, _, path = line[len("MCS-ROOT "):].partition(" ")
+    st = os.stat(src_root)
+    return path == os.path.realpath(src_root) and ino == str(st.st_ino)
+
+
+def same_inode(path: str, ino: int) -> bool:
+    try:
+        return os.lstat(path).st_ino == ino
+    except OSError:
+        return False
+
+
+def remote_resume(dest, session_id: str, cwd: str) -> str:
+    """The shell command that resumes the session on its host, from its project."""
+    _, account, root = dest
+    env = ("env -u CLAUDE_CONFIG_DIR " if account == DEFAULT_ACCOUNT
+           else f"env CLAUDE_CONFIG_DIR={shlex.quote(root)} ")
+    return f"cd {shlex.quote(cwd)} && {env}claude --resume {shlex.quote(session_id)}"
+
+
+def login_shell(command: str) -> str:
+    """`command` run by a login, interactive shell, so PATH is what a terminal on
+    the host gets. A bare ssh command runs with a minimal PATH."""
+    inner = f'"{command}"' if not re.search(r'["$`\\!]', command) else shlex.quote(command)
+    return f'exec "$SHELL" -lic {inner}'
+
+
+def ssh_t_text(host: str, command: str) -> str:
+    return f"ssh -t {host} {shlex.quote(login_shell(command))}"
+
+
+def resume_remote(dest, session_id: str, title: str, cwd: str, dir_ok: bool) -> int:
+    """Open the moved session on its host: a cmux ssh workspace inside cmux, else
+    ssh -t in this terminal. A missing project dir there is said, not resumed."""
+    host, account, _ = dest
+    command = remote_resume(dest, session_id, cwd)
+    if not dir_ok:
+        print(f"\n{cwd} does not exist on {host}, so the session was not resumed there.\n"
+              f"Check the project out on {host}, then run:\n  {ssh_t_text(host, command)}")
+        return 0
+    print(f"\nresuming as {account} on {host} in {short_path(cwd)}\n  {command}\n", flush=True)
+    try:
+        if os.environ.get("CMUX_SURFACE_ID") and shutil.which("cmux"):
+            os.execvp("cmux", ["cmux", "ssh", host, "--name", title[:40] or session_id[:8],
+                               "--command", command])
+        os.execvp("ssh", ["ssh", "-t", "-o", "ConnectTimeout=10", "--", host,
+                          login_shell(command)])
+    except OSError as e:
+        die(f"moved, but could not open it on {host}: {e}")
 
 
 # ---------------------------------------------------------------- picker data
@@ -433,23 +811,25 @@ def cached_labels(paths):
     return out
 
 
-def last_target_path() -> str:
-    return os.path.join(os.path.dirname(cache_path()), "last-target")
+def last_path(what: str) -> str:
+    return os.path.join(os.path.dirname(cache_path()), f"last-{what}")
 
 
-def last_target() -> str:
+def last_choice(what: str) -> str:
+    """The account ("target") or machine ("host") moved to last time."""
     try:
-        with open(last_target_path(), encoding="utf-8") as fh:
+        with open(last_path(what), encoding="utf-8") as fh:
             return fh.read().strip()
     except OSError:
         return ""
 
 
-def save_last_target(account: str) -> None:
+def save_last(account: str, host: str) -> None:
     try:
-        os.makedirs(os.path.dirname(last_target_path()), exist_ok=True)
-        with open(last_target_path(), "w", encoding="utf-8") as fh:
-            fh.write(account + "\n")
+        os.makedirs(os.path.dirname(last_path("target")), exist_ok=True)
+        for what, value in (("target", account), ("host", host)):
+            with open(last_path(what), "w", encoding="utf-8") as fh:
+                fh.write(value + "\n")
     except OSError:
         pass   # only a convenience
 
@@ -699,14 +1079,46 @@ def pick(header: str, rows, disabled=frozenset(), sections=None, start=0):
         return None
 
 
-def pick_account(source: str, targets):
+def pick_account(header: str, targets, rows):
     """Ask which account to move to, starting on the last one moved to."""
-    last = last_target()
-    j = pick(f"Move to which account?  (now in {source})",
-             [[(f"{a:<10}", account_role(a)), (short_path(account_root(a)), "cwd")]
-              for a in targets],
-             start=targets.index(last) if last in targets else 0)
+    last = last_choice("target")
+    j = pick(header, rows, start=targets.index(last) if last in targets else 0)
     return None if j is None else targets[j]
+
+
+def choose_machine():
+    """LOCAL or a configured host. With no hosts configured there is no step."""
+    hosts = configured_hosts()
+    if not hosts:
+        return LOCAL
+    machines = ([LOCAL] if len(accounts()) > 1 else []) + hosts
+    if len(machines) == 1:
+        return machines[0]
+    last = last_choice("host")
+    j = pick("Move to which machine?",
+             [[(f"{m:<10}", f"acct{n % 4}"), ("this machine" if m == LOCAL else "over ssh", "cwd")]
+              for n, m in enumerate(machines)],
+             start=machines.index(last) if last in machines else 0)
+    return None if j is None else machines[j]
+
+
+def interactive_remote(row, host: str, dry: bool, force: bool) -> int:
+    home, found = remote_accounts(host)
+    targets = list(found)
+    rows = [[(f"{a:<10}", f"acct{n % 4}"),
+             ("~" + root[len(home):] if root.startswith(home + "/") else root, "cwd"),
+             *([] if has_projects else [("  no sessions yet", "dim")])]
+            for n, (a, (root, has_projects)) in enumerate(found.items())]
+    target = targets[0] if len(targets) == 1 else pick_account(
+        f"Move to which account on {host}?  (now in {row['account']} on this machine)",
+        targets, rows)
+    if target is None:
+        return 1
+    dest = remote_dest(host, target)
+    moved = move_session(row["id"], target, dry, force, dest)
+    if moved is None:
+        return 0
+    return resume_remote(dest, row["id"], row["title"], *moved)
 
 
 def interactive(dry: bool, force: bool) -> int:
@@ -723,10 +1135,17 @@ def interactive(dry: bool, force: bool) -> int:
     if i is None:
         return 1
     row = rows[i]
+    machine = choose_machine()
+    if machine is None:
+        return 1
+    if machine != LOCAL:
+        return interactive_remote(row, machine, dry, force)
     targets = [a for a in accounts() if a != row["account"]]
     if not targets:
         die("only one Claude Code account found, nowhere to move to")
-    target = targets[0] if len(targets) == 1 else pick_account(row["account"], targets)
+    target = targets[0] if len(targets) == 1 else pick_account(
+        f"Move to which account?  (now in {row['account']})", targets,
+        [[(f"{a:<10}", account_role(a)), (short_path(account_root(a)), "cwd")] for a in targets])
     if target is None:
         return 1
 
@@ -775,14 +1194,31 @@ def main(argv):
     if not args:
         return interactive(dry, force)
     if len(args) != 2:
-        die("usage: move-claude-session [<session_id> <account>]. Try --help.")
+        die("usage: move-claude-session [<session_id> <account>[@<host>]]. Try --help.")
     session_id, target = args
+    if target not in accounts():
+        account, _, host = target.partition("@")
+        if host and host != LOCAL:
+            return move_to_host(session_id, account, check_host(host), dry, force)
+        target = account
     if target not in accounts():
         die(f"unknown account: {target} (one of {', '.join(accounts())})")
 
     cwd = move_session(session_id, target, dry, force)
     if cwd is not None:
         print(f"\ndone. resume with:  cd {shlex.quote(cwd)}; {resume_command(target, session_id)}")
+    return 0
+
+
+
+def move_to_host(session_id: str, account: str, host: str, dry: bool, force: bool) -> int:
+    dest = remote_dest(host, account)
+    moved = move_session(session_id, account, dry, force, dest)
+    if moved is not None:
+        cwd, dir_ok = moved
+        print(f"\ndone. resume with:  {ssh_t_text(host, remote_resume(dest, session_id, cwd))}")
+        if not dir_ok:
+            print(f"note: {cwd} does not exist on {host}. Check the project out there first.")
     return 0
 
 
