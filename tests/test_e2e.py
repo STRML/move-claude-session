@@ -608,6 +608,7 @@ class Remote(Harness):
         r = self.run_cli(S[4], "sigint@studio2", "--force")   # a retry must not lose it
         self.assertEqual(r.returncode, 1)
         self.assertIn("an earlier failed move left", r.stderr)
+        self.assertFalse([e for e in os.listdir(sigint) if e.endswith(".partial")])
         self.assertEqual(kept, [os.path.join(d, f) for d, _, fs in os.walk(sigint)
                                 for f in fs if f == "older"])
         self.assert_untouched_here(S[4])

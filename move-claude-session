@@ -394,6 +394,7 @@ COMMIT = r"""root=$1 stage=$2 force=$3 dir=$4 files=$5; shift 5
 trap '' HUP PIPE
 old="$stage.old"
 if [ -e "$old" ] || [ -L "$old" ]; then
+  rm -rf "$stage"
   printf 'MCS-STUCK an earlier failed move left the files it replaced in %s; put them back or delete them, then try again\n' "$old"
   exit 1
 fi
